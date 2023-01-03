@@ -1,25 +1,14 @@
 import torch
-from torch.library import Library as _Library
-_lib = _Library("aten", "IMPL")
 
-# Topk only works up to k=15 on MPS, replace it with a CPU fallback
-def _topk(self: torch.Tensor, k: int, dim:int=-1, largest:bool=True, sorted:bool=True):
-    res, indices = torch.topk(self.to('cpu'), k, dim, largest, sorted)
-    return res.to('mps'), indices.to('mps')
-
-_lib.impl("topk", _topk, "MPS")
-
-# Max doesn't work with longs on MPS, replace it with a CPU fallback
-def _max(self: torch.Tensor) -> torch.Tensor:
-    return torch.max(self.to('cpu')).to('mps')
-
-_lib.impl("max", _max, "MPS")
-
+if torch.has_mps:
+    import mps_fixups
+    mps_fixups.fixup_mps()
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 checkpoint = "bigcode/santacoder"
-device = "cpu" # for GPU usage or "cpu" for CPU usage
+device = "cpu"
+#device = "mps"
 
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
 model = AutoModelForCausalLM.from_pretrained(checkpoint, trust_remote_code=True).to(device)
