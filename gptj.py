@@ -16,7 +16,7 @@ import copy
 import struct
 import sys
 
-from graphs import exec_graph
+from graphs import Scope
 from torch._C import Graph, Node, dtype as cdtype
 
 from ansi.color import bg, fg
@@ -150,7 +150,9 @@ for name,ch in invocations.children.items():
             #print("code", optimized.graph)
             graph: Graph = optimized.inlined_graph
             print(graph)
-            exec_graph(graph, ch3.m, ch3.calls[0].args, ch3.calls[0].kwargs)
+
+            scope = Scope()
+            scope.exec_graph(graph, ch3.m, ch3.calls[0].args, ch3.calls[0].kwargs)
 
             #trace = jit.trace(ch3.m.forward, example_inputs=ch3.calls[0].args, example_kwarg_inputs=ch3.calls[0].kwargs)
             #print('trace', trace.inlined_graph)

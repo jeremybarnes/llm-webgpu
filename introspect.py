@@ -7,7 +7,7 @@ import inspect
 from dataclasses import dataclass, field
 import time
 from runtimes import print_elapsed
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from torch.utils.hooks import RemovableHandle
 
 def short_dtype(dtype: torch.dtype):
@@ -20,7 +20,7 @@ def short_dtype(dtype: torch.dtype):
         torch.int64: 'i64',
         torch.bool: 'b'
     }
-    
+
     return dtypes[dtype]
 
 def printParam(size: torch.Size, dtype: torch.dtype):
@@ -180,7 +180,7 @@ class ListTupleArg(Arg):
 @dataclass
 class Invocation:
     args: Tuple
-    kwargs: Dict[str, Any] = field(default_factory = dict)
+    kwargs: OrderedDict[str, Any] = field(default_factory = dict)
     output: Tuple = field(default_factory = tuple)
     elapsed: float = 0
 

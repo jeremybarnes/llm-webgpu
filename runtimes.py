@@ -4,10 +4,15 @@ from typing import List, Tuple, Dict
 from tensor_comparisons import TensorDifference
 import time
 
-def instrument_runtimes(model: Module, output: Dict[str, float]):
+def print_elapsed(elapsed: float) -> str:
+    return f"{int(elapsed*100000)*10}us"
+
+def instrument_runtimes(model: Module) -> Dict[str, float]:
     """
     Instrument the given model to collect runtimes of each type of layer in the given dict
     """
+
+    runtimes: Dict[str, float] = {}
 
     def recurse_module(m: Module, recursion: int, path: str):
 
@@ -25,7 +30,7 @@ def instrument_runtimes(model: Module, output: Dict[str, float]):
             elapsed = finish - start[0]
             if elapsed > 0.001:
                 s = path + " " + n
-                print(f"    {s:60} {int(elapsed*100000)*10:10}us")
+                print(f"    {s:60} {print_elapsed(elapsed):>12}")
             return None
 
         m.register_forward_pre_hook(pre_hook, with_kwargs=True)
@@ -35,3 +40,5 @@ def instrument_runtimes(model: Module, output: Dict[str, float]):
             recurse_module(child, recursion + 1, path + "." + name)
 
     recurse_module(model, 0, '')
+
+    return runtimes
