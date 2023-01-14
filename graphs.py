@@ -283,8 +283,11 @@ def aten_tanh(v1: Tensor) -> Tensor:
 
 @exec_op("aten::to")
 def aten_to(v1: Tensor, a1: Any, *rest) -> Any:
-    def option1(v1: Tensor, idt: int, non_blocking: bool = False, copy: bool = False, memory_format: Optional[memory_format] = None):
-        dt = int_to_dtype(idt)
+    def option1(v1: Tensor, idt: int|dtype, non_blocking: bool = False, copy: bool = False, memory_format: Optional[memory_format] = None):
+        if isinstance(idt, int):
+            dt = int_to_dtype(idt)
+        else:
+            dt = idt
         #print(f"{fg.green}trying to option 1 dt {dt}{reset}")
         assert memory_format is None
         return v1.to(dt, non_blocking, copy)
@@ -297,7 +300,15 @@ def aten_to(v1: Tensor, a1: Any, *rest) -> Any:
         assert memory_format is None
         return v1.to(v2, non_blocking, copy)
 
-    return option1(v1, a1, *rest)
+    if isinstance(a1, int) or isinstance(a1, torch.dtype):
+        return option1(v1, a1, *rest)
+    elif isinstance(a1, torch.device):
+        return option2(v1, a1, *rest)
+    elif isinstance(a1, torch.Tensor):
+        return option3(v1, a1, *rest)
+    else:
+        raise RuntimeError(f"can't figure out aten::to call with second parameter type {type(a1)}")
+
 
 @compile_op("aten::add")
 def compile_aten_add(n: Node) -> NodeOperator:
