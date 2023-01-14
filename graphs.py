@@ -47,9 +47,24 @@ NodeCompiler = Callable[[Node],NodeOperator]
 class Operation:
     name: str
     source: str
-    interpreter: NodeInterpreter
-    compiler: Optional[NodeCompiler] = None
-    operator: Optional[NodeOperator] = None
+    _interpreter: Optional[NodeInterpreter] = None
+    _compiler: Optional[NodeCompiler] = None
+    _operator: Optional[NodeOperator] = None
+
+    def interpret(self, s: 'Scope', n: Node) -> Any:
+        if self._interpreter is not None:
+            return self._interpreter(s, n)
+        else:
+            op: NodeOperator = self.compile(n)
+            return s.exec_node_op(n, op)
+
+    def compile(self, n: Node) -> NodeOperator:
+        if self._compiler is not None:
+            return self._compiler(n)
+        elif self._operator is not None:
+            return self._operator
+        else:
+            raise RuntimeError(f"node {self.name} has no compiler at {self.source}")
 
 _ops: Dict[str, List[Operation]] = {}
 _num_op_impls: int = 0
@@ -70,23 +85,7 @@ def _add_builtin_ops():
     #print(torch.jit.supported_ops._get_tensor_ops())
     ops = torch.jit._builtins._builtin_ops
     for method,name in ops:
-        print(f"{name} = {method}")
-
-        def make_interpreter(name: str, method: Any):
-            def interpreter(s: 'Scope', n: Node):
-                return s.exec_node_op(n, method)
-            return interpreter
-        
-        def make_compiler(name: str, method: Any):
-            def compiler(n: Node) -> NodeOperator:
-                return method
-            return compiler
-
-        op = Operation(name, "torch.jit._builtins", make_interpreter(name, method), make_compiler(name, method), method)
-        _add_op(op)
-        #if name in _ops:
-        #    raise RuntimeError(f"op {name} already registered: was {_ops[name].operator} now {method}")
-        #assert name not in _ops
+        _add_op(Operation(name, "torch.jit._builtins", _operator=method))
     print(f"added {len(_ops)} builtin ops with {_num_op_impls} implementations")
 
 _add_builtin_ops()
@@ -95,18 +94,15 @@ def interpret_op(name: str):
     def do_overrive(interpreter: NodeInterpreter) -> NodeInterpreter:
         frame = next(traceback.walk_stack(None))[0]
         source = str(frame.f_code)
-        _add_op(Operation(name, source, interpreter))
+        _add_op(Operation(name, source, _interpreter=interpreter))
         return interpreter
     return do_overrive
 
 def compile_op(name: str):
     def do_overrive(compiler: NodeCompiler) -> NodeCompiler:
-        def interpret(scope: 'Scope', node: Node):
-            compiled = compiler(node)
-            return scope.exec_node_op(node, compiled)
         frame = next(traceback.walk_stack(None))[0]
         source = str(frame.f_code)
-        _add_op(Operation(name, source, interpret, compiler))
+        _add_op(Operation(name, source, _compiler=compiler))
         return compiler
     return do_overrive
 
@@ -225,8 +221,8 @@ def aten_contiguous(t: Tensor, m: int):
 
 @compile_op("aten::slice")
 def compile_aten_slice(n: Node) -> NodeOperator:
-    for arg in n.inputs():
-        print("input", arg)
+    #for arg in n.inputs():
+    #    print("input", arg)
     def aten_slice_python(x: Any, start: Optional[int] = None, end: Optional[int] = None, step: int = 1):
         start = 0 if start is None else start
         end = len(x) if end is None else end
@@ -239,7 +235,7 @@ def compile_aten_slice(n: Node) -> NodeOperator:
         end = t.size(dim) if end is None else end
         step = 1 if step is None else step
 
-        print(f"{fg.blue}do_slice (dim {dim}): {start}:{end}:{step}{reset}")
+        #print(f"{fg.blue}do_slice (dim {dim}): {start}:{end}:{step}{reset}")
 
         if dim == 0:
             return t[start:end:step]
@@ -289,15 +285,15 @@ def aten_tanh(v1: Tensor) -> Tensor:
 def aten_to(v1: Tensor, a1: Any, *rest) -> Any:
     def option1(v1: Tensor, idt: int, non_blocking: bool = False, copy: bool = False, memory_format: Optional[memory_format] = None):
         dt = int_to_dtype(idt)
-        print(f"{fg.green}trying to option 1 dt {dt}{reset}")
+        #print(f"{fg.green}trying to option 1 dt {dt}{reset}")
         assert memory_format is None
         return v1.to(dt, non_blocking, copy)
     def option2(v1: Tensor, dev: device, dt: dtype, non_blocking: bool = False, copy: bool = False, memory_format: Optional[memory_format] = None):
-        print(f"{fg.green}trying to option 2{reset}")
+        #print(f"{fg.green}trying to option 2{reset}")
         assert memory_format is None
         return v1.to(dev, dt, non_blocking, copy)
     def option3(v1: Tensor, v2: Tensor, non_blocking: bool = False, copy: bool = False, memory_format: Optional[memory_format] = None):
-        print(f"{fg.green}trying to option 3{reset}")
+        #print(f"{fg.green}trying to option 3{reset}")
         assert memory_format is None
         return v1.to(v2, non_blocking, copy)
 
@@ -308,13 +304,13 @@ def compile_aten_add(n: Node) -> NodeOperator:
     def aten_add_tensors(t1: Tensor, t2: Tensor, alpha = 1):
         return add(t1, t2, alpha=alpha)
     def aten_add(t1: Any, t2: Any):
-        print(f"aten_add: {type(t1)} + {type(t2)}")
+        #print(f"aten_add: {type(t1)} + {type(t2)}")
         return t1 + t2
 
     # Choose which one based on the type of the first argument
     input1 = n.inputsAt(0)
     input2 = n.inputsAt(1)
-    print(input1.type(), input2.type())
+    #print(input1.type(), input2.type())
     if n.inputsSize() == 3 or (input1.type().kind() == "TensorType" and input2.type().kind() == "TensorType"):
         return aten_add_tensors
     else:
@@ -322,7 +318,7 @@ def compile_aten_add(n: Node) -> NodeOperator:
 
 @interpret_op("prim::If")
 def exec_prim_if(s: 'Scope', n: Node):
-    print(n)
+    #print(n)
     input = s.collect_inputs(n)
     cond: bool = input[0]
     blocks = list(n.blocks())
@@ -339,7 +335,7 @@ def exec_prim_if(s: 'Scope', n: Node):
 
     res = s.exec_node(return_node)
 
-    print("adding outputs", res, n)
+    #print("adding outputs", res, n)
 
     s.add_outputs(res, n)
 
@@ -395,7 +391,7 @@ class Scope:
 
         def do_output(o: Value, v: Any):
             self.add_var(o.debugName(), v)
-            print("  ", self.print_var_named(o.debugName()))
+            #print("  ", self.print_var_named(o.debugName()))
 
         if n.outputsSize() == 0:
             pass
@@ -409,7 +405,7 @@ class Scope:
                 do_output(o, result[o.offset()])
 
     def exec_node_op(self, n: Node, op: NodeOperator):
-        print(n)
+        #print(n)
         #print("invoking", n)
         inputs = self.collect_inputs(n)
         result = op(*inputs)
@@ -419,7 +415,7 @@ class Scope:
     def exec_node(self, n: Node) -> Any:
         found: Operation = self._find_operation(n)
         #print(f"found {n} {found}")
-        return found.interpreter(self, n)
+        return found.interpret(self, n)
 
     def exec_graph(self, g: Graph|Block, module: Module, args: Tuple, kwargs: OrderedDict[str, Any]):
         # Seed variables with inputs
@@ -441,7 +437,7 @@ class Scope:
         for node in g.nodes():
             result = self.exec_node(node)
 
-        print("finished")
-        self.print_vars()
+        #print("finished")
+        #self.print_vars()
         return result
 

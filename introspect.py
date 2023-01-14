@@ -6,6 +6,7 @@ from typing import Dict, List, Any, Tuple, Optional, Callable
 import inspect
 from dataclasses import dataclass, field
 import time
+import copy
 from runtimes import print_elapsed
 from collections import defaultdict, OrderedDict
 from torch.utils.hooks import RemovableHandle
@@ -449,7 +450,8 @@ def record_invocations(model: Module) -> Tuple[Invocations, Callable]:
     def recurse_module(m: Module, recursion: int, path: str) -> Invocations:
         invs = Invocations(m, path)
 
-        def pre_hook(module: Module, args: Tuple, kwargs: Dict):
+        def pre_hook(module: Module, args: Tuple, kwargs: OrderedDict[str,Any]):
+            #inv = Invocation(copy.deepcopy(args), copy.deepcopy(kwargs), (), time.time())
             inv = Invocation(args, kwargs, (), time.time())
             invs.calls.append(inv)
             return None

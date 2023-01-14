@@ -1,8 +1,86 @@
 import torch
 from torch.nn import Module
-from typing import List, Tuple, Dict, Generator
+from typing import List, Tuple, Dict, Generator, Any, Optional
 from tensor_comparisons import TensorDifference
 import copy
+
+def fixup_argument(arg: Any, device: torch.device, dtype: Optional[torch.dtype] = None):
+    #print('fixup argument', type(arg), isinstance(arg, Generator))
+    if isinstance(arg, torch.Tensor):
+        if arg.storage_offset() > 0 and dtype is None:
+            #print("storage_offset =", arg.storage_offset())
+            old_storage = arg.storage()
+            new_storage = torch.TypedStorage(old_storage.size(), device=device, dtype=old_storage.dtype).copy_(old_storage)
+            res = torch.Tensor().to(device, arg.dtype)
+            res.set_(new_storage, arg.storage_offset(), arg.size(), arg.stride())
+            #print("storage_offset =", arg.storage_offset(), "new storage offset =", res.storage_offset())
+            assert res.storage_offset() == arg.storage_offset()
+            assert res.size() == arg.size()
+            assert res.stride() == arg.stride()
+        else:
+            # dtype is only changed for floating point types, otherwise we just shift device
+            if dtype is not None and arg.dtype.is_floating_point:
+                res = arg.to(device, dtype)
+            else:
+                res = arg.to(device)
+        return res
+    elif isinstance(arg, List) or isinstance(arg, Generator):
+        return list([fixup_argument(a, device, dtype) for a in arg])
+    elif isinstance(arg, Tuple):
+        return tuple((fixup_argument(a, device, dtype) for a in arg))
+    elif isinstance(arg, Dict):
+        return dict({k: fixup_argument(v, device, dtype) for k,v in arg.items()})
+    else:
+        return arg
+
+def compare_output(expected: Any, received: Any, name: str) -> TensorDifference:
+    #print("compare: expected ", expected, "received", received)
+    if type(expected) != type(received):
+        # Coerce to tuple if one is a tuple
+        if isinstance(expected, tuple) or isinstance(received, tuple):
+            return compare_output(tuple(expected), tuple(received), name)
+        # Coerce to dict if one is a dict
+        if isinstance(expected, dict) or isinstance(received, dict):
+            return compare_output(dict(expected), dict(received), name)
+        raise RuntimeError(f'{name} types differ: {type(expected)} vs {type(received)}')
+
+    if isinstance(expected, torch.Tensor):
+        if expected.shape != received.shape:
+            raise RuntimeError(f'{name} tensor shapes differ: {expected.shape} vs {received.shape}')
+        return TensorDifference.between(expected, received.to(expected.device))
+
+    elif isinstance(expected, list) or isinstance(expected, tuple):
+        if len(expected) != len(received):
+            raise RuntimeError("{name} lengths differ: {len(expected)} vs {len(received})")
+        res = TensorDifference()
+        for i in range(len(expected)):
+            res2 = compare_output(expected[i], received[i], name + "[" + str(i) + "]")
+            if res.ulps < res2.ulps:
+                res = res2
+        return res
+    elif isinstance(expected, dict):
+        items1 = sorted(expected.items())
+        items2 = sorted(received.items())
+
+        keys1 = [k for k,_ in items1]
+        keys2 = [k for k,_ in items2]
+
+        if keys1 != keys2:
+            raise RuntimeError(f"{name} dict keys differ: {keys1} vs {keys2}")
+
+        # Compare the values for each key
+        res = TensorDifference()
+        for i in range(len(keys1)):
+            k,v1 = items1[i]
+            _,v2 = items2[i]
+            res2 = compare_output(v1, v2, name + "{" + k + "}")
+            if res.ulps < res2.ulps:
+                res = res2
+        return res
+    else:
+        if expected == received:
+            return TensorDifference()
+        raise RuntimeError(f'{name} outputs differ: {expected} vs {received}')
 
 def device_comparison_mode(model: Module, master_device: torch.device, master_dtype: torch.dtype, scenarios: List[Tuple[torch.device, torch.dtype]]):
     """
@@ -63,23 +141,6 @@ def device_comparison_mode(model: Module, master_device: torch.device, master_dt
 
 
                 try:
-                    def fixup_argument(arg, device, dtype):
-                        #print('fixup argument', type(arg), isinstance(arg, Generator))
-                        if isinstance(arg, torch.Tensor):
-                            # dtype is only changed for floating point types, otherwise we just shift device
-                            if arg.dtype.is_floating_point:
-                                return arg.to(device, dtype)
-                            else:
-                                return arg.to(device)
-                        elif isinstance(arg, List) or isinstance(arg, Generator):
-                            return list([fixup_argument(a, device, dtype) for a in arg])
-                        elif isinstance(arg, Tuple):
-                            return tuple((fixup_argument(a, device, dtype) for a in arg))
-                        elif isinstance(arg, Dict):
-                            return dict({k: fixup_argument(v, device, dtype) for k,v in arg.items()})
-                        else:
-                            return arg
-
                     def fixup_to_slave(arg):
                         return fixup_argument(arg, device, dtype)
 
@@ -108,54 +169,6 @@ def device_comparison_mode(model: Module, master_device: torch.device, master_dt
                     return None
 
                 biggest: List[Optional[TensorDifference]] = [None]
-
-                def compare_output(expected, received, name: str):
-                    #print("compare: expected ", expected, "received", received)
-                    if type(expected) != type(received):
-                        # Coerce to tuple if one is a tuple
-                        if isinstance(expected, tuple) or isinstance(received, tuple):
-                            return compare_output(tuple(expected), tuple(received), name)
-                        # Coerce to dict if one is a dict
-                        if isinstance(expected, dict) or isinstance(received, dict):
-                            return compare_output(dict(expected), dict(received), name)
-                        raise RuntimeError(f'{name} types differ: {type(expected)} vs {type(received)}')
-
-                    if isinstance(expected, torch.Tensor):
-                        if expected.shape != received.shape:
-                            raise RuntimeError(f'{name} tensor shapes differ: {expected.shape} vs {received.shape}')
-                        res = TensorDifference.between(expected, received)
-                        if biggest[0] is None or res.ulps > biggest[0].ulps:
-                            biggest[0] = res
-
-                        #if res.is_significant():
-                        #    print(res)
-                        #if res:
-                        #    print(res)
-                            #raise RuntimeError(f'{name} tensors differ: {res}')
-                        return
-
-                    elif isinstance(expected, list) or isinstance(expected, tuple):
-                        if len(expected) != len(received):
-                            raise RuntimeError("{name} lengths differ: {len(expected)} vs {len(received})")
-                        for i in range(len(expected)):
-                            compare_output(expected[i], received[i], name + "[" + str(i) + "]")
-                    elif isinstance(expected, dict):
-                        items1 = sorted(expected.items())
-                        items2 = sorted(received.items())
-
-                        keys1 = [k for k,_ in items1]
-                        keys2 = [k for k,_ in items2]
-
-                        if keys1 != keys2:
-                            raise RuntimeError(f"{name} dict keys differ: {keys1} vs {keys2}")
-
-                        # Compare the values for each key
-                        for i in range(len(keys1)):
-                            k,v1 = items1[i]
-                            _,v2 = items2[i]
-                            compare_output(v1, v2, name + "{" + k + "}")
-                    else:
-                        raise RuntimeError(f'{name} outputs differ: {expected} vs {received}')
 
                 compare_output(master_output, slave_output, str(device) + " " + str(dtype) + " " + path)
                 print(prefix + f" {biggest[0].ulps:>5} ulps")

@@ -68,8 +68,8 @@ def ulps_difference(i1: torch.Tensor, i2: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class TensorDifference:
-    expected: Tensor
-    received: Tensor
+    expected: Optional[Tensor] = None
+    received: Optional[Tensor] = None
     
     index: int = 0
     v1: Optional[Tensor] = None
@@ -119,7 +119,10 @@ class TensorDifference:
         flat2 = received.to('cpu').flatten()
 
         if not dt1.is_floating_point:
-            diff = torch.abs(flat2 - flat1)
+            if dt1 == torch.bool:
+                diff = torch.logical_xor(flat2,flat1).to(torch.uint8)
+            else:
+                diff = torch.abs(flat2 - flat1)
             result.difference = diff.max().item()
             result.index = int(diff.argmax().item())
 
