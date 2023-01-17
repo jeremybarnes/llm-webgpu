@@ -500,10 +500,11 @@ def choose_overload_for_aten(operator: str,
 def summarize_tensor(t: Tensor) -> str:
     result = short_dtype(t.dtype) + '[' + ']['.join([str(s) for s in t.shape]) + ']'
     nel = t.numel()
+    strt = str(t).replace('Parameter containing:\n', '').replace('tensor(', '').replace('\n', ' ')
     if nel > 10:
-        return result + "=" + str(t)[0:50] + "..."
+        return result + "=" + strt[0:50] + "..."
     else:
-        return result + "=" + str(t)
+        return result + "=" + strt
 
 int_to_dtype_table = [
     torch.uint8,

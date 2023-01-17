@@ -456,7 +456,11 @@ GPT_NEO_INPUTS_DOCSTRING = r"""
     GPT_NEO_START_DOCSTRING,
 )
 class GPTNeoModel(GPTNeoPreTrainedModel):
-    def __init__(self, config):
+
+    _dtype: torch.dtype = torch.float32
+    _device: torch.device = torch.device('cpu')
+
+    def __init__(self, config: GPTNeoConfig):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -467,6 +471,7 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -475,6 +480,14 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
 
     def set_input_embeddings(self, new_embeddings):
         self.wte = new_embeddings
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def device(self):
+        return self._device
 
     @add_start_docstrings_to_model_forward(GPT_NEO_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
@@ -505,6 +518,7 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         #print("input_ids", input_ids)
+        #print("inputs_embeds", inputs_embeds)
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -682,6 +696,14 @@ class GPTNeoForCausalLM(GPTNeoPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def device(self):
+        return self._device
 
     def get_output_embeddings(self):
         return self.lm_head

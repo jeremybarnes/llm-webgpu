@@ -273,6 +273,20 @@ def aten_eq(v1: Any, v2: Any) -> Any:
     else:
         return v1 == v2
 
+@exec_op("aten::lt")
+def aten_lt(v1: Any, v2: Any) -> Any:
+    if isinstance(v1, Tensor):
+        return v1.lt(v2)
+    else:
+        return v1 < v2
+
+@exec_op("aten::gt")
+def aten_gt(v1: Any, v2: Any) -> Any:
+    if isinstance(v1, Tensor):
+        return v1.gt(v2)
+    else:
+        return v1 > v2
+
 @exec_op("aten::pow")
 def aten_pow(v1: Tensor, v2: Tensor|float) -> Tensor:
     return v1.pow(v2)
@@ -385,9 +399,9 @@ class Scope:
     def print_var_named(self, sn: str) -> str:
         return self.print_var_index(self.var_names[sn])
 
-    def print_vars(self):
+    def print_vars(self, indent: str = ''):
         for i in range(len(self.vars)):
-            print(self.print_var_index(i))
+            print(indent + self.print_var_index(i))
 
     def collect_inputs(self, n: Node) -> Tuple[Any,...]:
         def get_input(input: Value) -> Any:

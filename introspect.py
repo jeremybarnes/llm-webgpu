@@ -2,7 +2,7 @@ import torch
 import torch.jit as jit
 from torch.jit import RecursiveScriptModule, ScriptModule
 from torch.nn import Module
-from typing import Dict, List, Any, Tuple, Optional, Callable
+from typing import Dict, List, Any, Tuple, Optional, Callable, Sequence, SupportsInt, Union
 import inspect
 from dataclasses import dataclass, field
 import time
@@ -122,6 +122,19 @@ class ShapeRange:
         self.min = min(self.min, val)
         self.max = max(self.max, val)
 
+    def add(self, val: 'ShapeRange'):
+        self.do(val.min)
+        self.do(val.max)
+
+    def __init__(self, val:Optional[Union[SupportsInt,'ShapeRange']] = None):
+        if isinstance(val, ShapeRange):
+            self.min = val.min
+            self.max = val.max
+        elif val is None:
+            pass
+        else:
+            self.min = self.max = int(val)
+
     def __repr__(self) -> str:
         if self.max < self.min:
             return "[*]"
@@ -130,16 +143,72 @@ class ShapeRange:
         else:
             return f"[{self.min}-{self.max}]"
 
+@dataclass
+class TensorShape:
+    """
+    Shape range for a fixed number of dimensions
+    """
+    dims: List[ShapeRange] = field(default_factory=list)
+
+    def __init__(self, dims: Sequence[ShapeRange|SupportsInt]):
+        self.dims = [ShapeRange(s) for s in dims]
+
+    def __len__(self) -> int:
+        return len(self.dims)
+
+    def __getitem__(self, item: int) -> ShapeRange:
+        return self.dims[item]
+
+    def __repr__(self) -> str:
+        return ''.join([str(s) for s in self.dims])
+
+    def do(self, shape: List[int]):
+        assert len(shape) == len(self)
+        for dim,sh in zip(self.dims, shape):
+            dim.do(sh)
+
+    def add(self, shape: 'TensorShape'):
+        assert len(shape) == len(self)
+        for dim,sh in zip(self.dims, shape.dims):
+            dim.add(sh)
+
+@dataclass
+class TensorShapes:
+    """
+    Shape range for a variable number of dimensions.  For when something is called
+    with multiple tensor dimensions.
+    """
+
+    lengths: Dict[int, TensorShape] = field(default_factory=dict)
+
+    def add(self, shape: TensorShape):
+        l = len(shape.dims)
+        if l not in self.lengths:
+            self.lengths[l] = shape
+        else:
+            self.lengths[l].add(shape)
+
+    def do(self, size: Sequence[SupportsInt]):
+        shape = TensorShape(size)
+        l = len(shape)
+        if l in self.lengths:
+            self.lengths[l].add(shape)
+        else:
+            self.lengths[l] = shape
+
+    def __repr__(self) -> str:
+        return ' | '.join(str(shape) for len,shape in sorted(self.lengths.items()))
+
 class TensorArg(Arg):
     dtype: torch.dtype
-    shape: List[ShapeRange]
+    shape: TensorShapes
 
-    def __init__(self, dtype: torch.dtype, shape: List[ShapeRange]):
+    def __init__(self, dtype: torch.dtype, shape: TensorShapes):
         self.dtype = dtype
         self.shape = shape
 
     def __repr__(self) -> str:
-        return f"Tensor({self.dtype}{''.join([str(s) for s in self.shape])})"
+        return f"Tensor({self.dtype}{self.shape})"
 
 class OptionalArg(Arg):
     value: Arg
@@ -326,24 +395,13 @@ class ArgumentData:
                 raise NotImplementedError("Can't handle multiple tensor types yet")
             tensor_dtype = list(self.tensor_dtypes)[0]
 
-            tensor_shapelens: Dict[int, int] = {}
-            for sh in self.tensor_shapes.keys():
-                #print(f"sh = {sh} len = {len(sh)}")
-                tensor_shapelens[len(sh)] = tensor_shapelens.get(len(sh), 0) + 1
-            
-            if len(tensor_shapelens) > 1:
-                raise NotImplementedError("Can't handle multiple tensor shape lengths yet")
+            shapes = TensorShapes()
 
-            tensor_shapelen = list(tensor_shapelens.keys())[0]
-            #print('tensor_shapelen = ', tensor_shapelen)
+            for sh,_ in self.tensor_shapes.items():
+                shapes.add(TensorShape(sh))
 
-            tensor_shaperanges: List[ShapeRange] = [ShapeRange() for _ in range(tensor_shapelen)]
+            return wrapper(TensorArg(tensor_dtype, shapes))
 
-            for sh,count in self.tensor_shapes.items():
-                for i in range(tensor_shapelen):
-                    tensor_shaperanges[i].do(sh[i])
-
-            return wrapper(TensorArg(tensor_dtype, tensor_shaperanges))
         elif issubclass(first_type, tuple):
             if len(self.tuple_lengths) > 1:
 
@@ -401,6 +459,24 @@ class SummaryData:
         for kw,arg in self.kwargs.items():
             print(f"{ind}{kw}: {arg.summarize()}")
 
+    def add(self, other: 'SummaryData'):
+        """
+        Add another summary to make a combined summary.
+        """
+        for l,n in other.arg_lengths.items():
+            self.arg_lengths[l] = self.arg_lengths.get(l, 0) + n
+
+        for i,ad in enumerate(other.args):
+            if i < len(self.args):
+                self.args[i].combine(ad)
+            else:
+                self.args.append(ad)
+
+        for n,ad in other.kwargs.items():
+            if n in self.kwargs:
+                self.kwargs[n].combine(ad)
+            else:
+                self.kwargs[n] = ad
 
 @dataclass
 class Invocations:

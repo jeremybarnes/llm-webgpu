@@ -9,6 +9,7 @@ from torch.nn import Module
 from torch import Tensor, ScriptModule, ScriptFunction, Value, Size, Block, dtype, memory_format, device, scalar_tensor, add, tanh
 import torch.jit as jit
 import torch.fx as fx
+from torch.fx import symbolic_trace
 import torch
 import inspect
 import time
@@ -17,8 +18,10 @@ import struct
 import sys
 from scriptable_gpt_neo import GPTNeoForCausalLM
 
-from graphs import Scope, Operation, default_find_operation
+from graphs import Scope, Operation, default_find_operation, _print_value as print_value
 from torch._C import Graph, Node, dtype as cdtype
+from dataclasses import dataclass, field
+
 
 from ansi.color import bg, fg
 from ansi.color.fx import reset
@@ -48,13 +51,19 @@ def init_model(klass: Type[PreTrainedModel], model: str, *args, **kwargs) -> Tup
     tok: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(model, *args)
 
     if str(device) == 'cpu':
-        return res.to(device, torch.float32), tok
+        result = res.to(device, torch.float32), tok
+        result[0]._dtype = torch.float32
 
     elif str(device) == 'mps':
-        return res.to(device, dtype), tok
+        result = res.to(device, dtype), tok
+        result[0]._dtype = dtype
 
     else:
         raise RuntimeError(f'unknown device {str(device)}')
+
+    result[0]._device = device
+    return result
+
 
 llm: str = ''
 model: Module
@@ -76,7 +85,7 @@ else:
 #print("tok=", tokenizer)
 #print("model=", model)
 
-from introspect import introspect_model, record_invocations
+from introspect import introspect_model, record_invocations, SummaryData
 #introspect_model(model)
 
 
@@ -125,6 +134,135 @@ print(inspect.signature(invocations.m.forward))
 
 sd = invocations.summarize()
 sd.print_args()
+
+
+from introspect import Invocations
+from runtimes import print_elapsed
+from introspect import Invocations
+
+from optimize_script import OptimizeModelData, optimize_script, ModuleOptimizationInfo
+
+
+
+
+def _optimize_module(invocations: Invocations, dtype: torch.dtype, device: torch.device, cache: OptimizeModelData) -> Module:
+    # See if the graph can be scripted
+    module = invocations.m
+    script: Optional[ScriptModule] = None
+    optimized: Optional[Module] = None
+
+    mod_name = module._get_name()
+    if mod_name in cache.modules:
+        return cache.modules[mod_name]
+
+    try:
+        pass
+        script = torch.jit.script(module)
+    except Exception as e:
+        print(f"{invocations.path} is not scriptable: {e}")
+        pass
+
+    if script is not None:
+        info = cache.optinfo[mod_name]
+        try:
+            optimized = optimize_script(script, invocations, info)
+            #optimized.dtype = script.dtype
+
+            #print(f"dtype is {script.dtype}")
+            #print(f"new dtype is {optimized.dtype}")
+
+            # Some of the sanity checks use the parameters to know which device the
+            # model is on.  So we play along by adding them back in.
+            #for name,param in module.named_parameters(recurse=False):
+            #    print(f"parameter {name}={print_value(param)}")
+            #    optimized.register_parameter(name, param)
+            #print("successfully optimized", invocations.path)
+            print(f"{invocations.path} was optimized to {optimized}")
+
+        except Exception as e:
+            raise
+            print(f"{invocations.path} is not optimizable: {e}")
+            pass
+
+    if optimized is None:
+        # try to optimize each of the children, as we couldn't optimize the parent
+        optimized = copy.deepcopy(module)
+
+        for name,child in module.named_children():
+            child_invocations = invocations.children[name]
+            assert child_invocations.m is child
+            optimized_child = _optimize_module(child_invocations, dtype, device, cache)
+            optimized.add_module(name, optimized_child)
+            #setattr(optimized, name, optimized_child)
+
+
+    def try_set(attr: str, val: Any):
+        try:
+            setattr(optimized, attr, val)
+        except:
+            pass
+
+    try_set('dtype', dtype)
+    try_set('_dtype', dtype)
+    try_set('devicer', device)
+    try_set('_device', device)
+
+    #print(f"params before {len(list(module.parameters()))}")
+    #print(f"params after {len(list(optimized.parameters()))}")
+    #assert len(list(module.named_parameters())) == len(list(optimized.named_parameters()))
+    #print("module.dtype", module.dtype)
+    #assert optimized.dtype == module.dtype
+
+    cache.modules[mod_name] = optimized
+    return optimized
+
+def optimize_module(invocations: Invocations, dtype: torch.dtype, device: torch.device):
+    cache = OptimizeModelData()
+
+    # Find the full set of invocations per module
+    def recurse_invocations(i: Invocations):
+        model_name = i.m._get_name()
+        if model_name not in cache.optinfo:
+            cache.optinfo[model_name] = ModuleOptimizationInfo()
+        info = cache.optinfo[model_name]
+        info.add(i)
+
+        for n,ch in i.children.items():
+            recurse_invocations(ch)
+
+    recurse_invocations(invocations)
+
+    for name,info in sorted(cache.optinfo.items()):
+        print(f"module {name} has {len(info.invocations)} invocations with runtime {print_elapsed(info.total_runtime())}")
+        info.summary.print_args(8)
+        print()
+
+    return _optimize_module(invocations, dtype, device, cache)
+
+compiled_mod = torch.compile(model)
+
+optimized_mod = optimize_module(invocations, dtype, device)
+
+cpu_mod = copy.deepcopy(model).to('cpu')
+
+#print("compiled_mod", compiled_mod)
+
+from runtimes import print_elapsed
+
+for m,name in [(model,"base"),(compiled_mod,"compiled"),(optimized_mod,"optimized"),(optimized_mod,"optimized2"),(cpu_mod,"cpu"),]:
+    before = time.time()
+    model_inputs = input_ids if name != "cpu" else input_ids.to('cpu')
+    gen_tokens = m.generate(
+        model_inputs,
+        do_sample=False,  # make it deterministic for debugging
+        temperature=0.9,
+        max_length=50,
+    )
+    after = time.time()
+    print(type(m))
+    print(f"{name:30} {m.device} {m.dtype} {print_elapsed(after-before)}")
+
+exit(1)
 
 from graph_comparison import make_compare_operation
 
