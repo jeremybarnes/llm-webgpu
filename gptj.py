@@ -158,6 +158,7 @@ def _optimize_module(invocations: Invocations, dtype: torch.dtype, device: torch
     try:
         pass
         script = torch.jit.script(module)
+        #script = symbolic_trace(module)
     except Exception as e:
         print(f"{invocations.path} is not scriptable: {e}")
         pass

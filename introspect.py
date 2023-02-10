@@ -2,7 +2,7 @@ import torch
 import torch.jit as jit
 from torch.jit import RecursiveScriptModule, ScriptModule
 from torch.nn import Module
-from typing import Dict, List, Any, Tuple, Optional, Callable, Sequence, SupportsInt, Union
+from typing import Dict, List, Any, Tuple, Optional, Callable, Sequence, SupportsInt, Union, Iterator
 import inspect
 from dataclasses import dataclass, field
 import time
@@ -24,7 +24,7 @@ def short_dtype(dtype: torch.dtype):
 
     return dtypes[dtype]
 
-def printParam(size: torch.Size, dtype: torch.dtype):
+def printParam(size: torch.Size, dtype: torch.dtype, device: torch.device):
     dsizeof = {
         torch.float32: 4,
         torch.float16: 2,
@@ -43,7 +43,7 @@ def printParam(size: torch.Size, dtype: torch.dtype):
     else:
         totalSize = str(totalBytes / 1024 / 1024) + " mb"
 
-    return short_dtype(dtype) + '[' + ','.join([str(s) for s in size]) + "] (" + totalSize + ")"
+    return short_dtype(dtype) + '[' + ','.join([str(s) for s in size]) + "] (" + totalSize + ")" + " " + str(device)
 
 def introspect_model(m: Module):
     """
@@ -59,9 +59,9 @@ def introspect_model(m: Module):
         #print(f'{indent}got {m._get_name()} at {path} recursion {recursion}')
         print(f'{indent}{path} {m._get_name()}{inspect.signature(m.forward)}')
         for name,buffer in m.named_buffers(path, recurse=False):
-            print(f'{indent}    buffer {name} is {printParam(buffer.shape, buffer.dtype)}')
+            print(f'{indent}    buffer {name} is {printParam(buffer.shape, buffer.dtype, buffer.device)}')
         for name,param in m.named_parameters(path, recurse=False):
-            print(f'{indent}    parameter {name} is {printParam(param.shape, param.dtype)}')
+            print(f'{indent}    parameter {name} is {printParam(param.shape, param.dtype, param.device)}')
 
         gotScripted = None
         print_details = m._get_name() == "Embedding"
@@ -99,11 +99,57 @@ def introspect_model(m: Module):
 
 
 class Arg:
-    pass
+    """
+    Base class for information about an argument to a function.
+    """
+
+    def get_type(self) -> type:
+        """
+        Return the type of this argument, or a superclass if the type can vary.
+        This should not return NoneType unless the argument is a constant None;
+        instead, is_optional() should return true.
+        """
+        raise RuntimeError(f"Class {self.__class__.__name__} doesn't override get_type()")
+
+    def is_optional(self) -> bool:
+        """
+        Return true if this is optional; in other words, if None is one of the possible
+        values for the argument.  The other methods return information for the non-optional
+        case.
+        """
+        return False
+
+    def non_optional(self) -> 'Arg':
+        """
+        Returns the non-optional version of this type.  Default checks that is_optional() is
+        false and returns self (which works for all non-optional types).
+        """
+        assert not self.is_optional()
+        return self
+
+    def get_dtype(self) -> Optional[torch.dtype]:
+        """
+        Return the dtype of this argument, None if it's not a tensor.
+        """
+        return None
+
+    def get_device(self) -> Optional[torch.device]:
+        """
+        Return the device of this argument, None if it's not a tensor.
+        """
+        return None
+
+    def get_shape(self) -> Optional['TensorShapes']:
+        """
+        Return the shape of this argument, None if it's not a tensor.
+        """
+        return None
 
 class UnknownArg(Arg):
     def __str__(self) -> str:
         return "Unknown()"
+
+    def get_type(self) -> type: return object
 
 class ConstantArg(Arg):
     value: Any
@@ -114,10 +160,29 @@ class ConstantArg(Arg):
     def __repr__(self) -> str:
         return f"Constant({self.value})"
 
+    def get_type(self) -> type: return type(self.value)
+
 @dataclass
 class ShapeRange:
     min: int = 10000000000
     max: int = 0
+
+    def is_const(self) -> bool:
+        """
+        Is this shape a constant int value?
+        """
+        return self.min == self.max
+
+    def const_value(self) -> int:
+        """
+        Return the constant shape for this dimension.
+
+        PRE: is_const() is true.
+        """
+        if self.min != self.max:
+            raise RuntimeError("asked for constant value with is_const() false")
+        return self.min
+
     def do(self, val: int):
         self.min = min(self.min, val)
         self.max = max(self.max, val)
@@ -159,6 +224,9 @@ class TensorShape:
     def __getitem__(self, item: int) -> ShapeRange:
         return self.dims[item]
 
+    def __iter__(self) -> Iterator[ShapeRange]:
+        return iter(self.dims)
+
     def __repr__(self) -> str:
         return ''.join([str(s) for s in self.dims])
 
@@ -171,6 +239,13 @@ class TensorShape:
         assert len(shape) == len(self)
         for dim,sh in zip(self.dims, shape.dims):
             dim.add(sh)
+
+    @staticmethod
+    def from_tensor(t: torch.Tensor) -> 'TensorShape':
+        """
+        Return a TensorShape object from a single tensor.
+        """
+        return TensorShape(t.size())
 
 @dataclass
 class TensorShapes:
@@ -196,21 +271,46 @@ class TensorShapes:
         else:
             self.lengths[l] = shape
 
+    @staticmethod
+    def from_tensor(t: torch.Tensor) -> 'TensorShapes':
+        """
+        Return a TensorShapes object from a single tensor.
+        """
+        result = TensorShapes()
+        result.add(TensorShape.from_tensor(t))
+        return result
+
     def __repr__(self) -> str:
         return ' | '.join(str(shape) for len,shape in sorted(self.lengths.items()))
 
+
 class TensorArg(Arg):
+    """
+    Describes a tensor-valued argument.
+    """
     dtype: torch.dtype
+    device: torch.device
     shape: TensorShapes
 
-    def __init__(self, dtype: torch.dtype, shape: TensorShapes):
+    def __init__(self, dtype: torch.dtype, device: torch.device, shape: TensorShapes):
         self.dtype = dtype
+        self.device = device
         self.shape = shape
 
     def __repr__(self) -> str:
-        return f"Tensor({self.dtype}{self.shape})"
+        return f"Tensor({self.dtype}{self.shape}{self.device})"
+
+    def get_type(self) -> type: return torch.Tensor
+    def get_dtype(self) -> Optional[torch.dtype]: return self.dtype
+    def get_device(self) -> Optional[torch.device]: return self.device
+    def get_shape(self) -> Optional['TensorShapes']: return self.shape
+
 
 class OptionalArg(Arg):
+    """
+    Describes an argument that can be either None or another value, representing
+    optional or defaulted values.
+    """
     value: Arg
 
     def __init__(self, value: Arg):
@@ -218,6 +318,13 @@ class OptionalArg(Arg):
 
     def __repr__(self) -> str:
         return f"Optional({self.value})"
+
+    def is_optional(self) -> bool: return True
+    def non_optional(self) -> 'Arg': return self.value
+    def get_type(self) -> type: return self.value.get_type()
+    def get_dtype(self) -> Optional[torch.dtype]: return self.value.get_dtype()
+    def get_device(self) -> Optional[torch.device]: return self.value.get_device()
+    def get_shape(self) -> Optional['TensorShapes']: return self.value.get_shape()
 
 class TupleArg(Arg):
     """
@@ -231,6 +338,8 @@ class TupleArg(Arg):
 
     def __repr__(self) -> str:
         return f"Tuple({self.values})"
+
+    def get_type(self) -> type: return tuple
 
 class ListTupleArg(Arg):
     """
@@ -246,6 +355,8 @@ class ListTupleArg(Arg):
 
     def __repr__(self) -> str:
         return f"ListTuple({self.value}{self.length})"
+
+    def get_type(self) -> type: return tuple
 
 @dataclass
 class Invocation:
@@ -266,7 +377,7 @@ class Invocation:
                 if arg.numel() < 10:
                     return str(arg)
                 else:
-                    return printParam(arg.size(), arg.dtype) + " " + str(arg.device)
+                    return printParam(arg.size(), arg.dtype, arg.device) + " " + str(arg.device)
             else:
                 return str(arg)
 
@@ -280,6 +391,7 @@ class ArgumentData:
     count: int = 0
     types: Dict[type, int] = field(default_factory = dict)
     tensor_dtypes: Dict[torch.dtype, int] = field(default_factory = dict)
+    tensor_devices: Dict[torch.device, int] = field(default_factory = dict)
     tensor_shapes: Dict[torch.Size, int] = field(default_factory = dict)
     tensor_values: Dict[torch.Tensor, int] = field(default_factory = dict, repr=False)
     tuple_lengths: Dict[int, int] = field(default_factory=dict)
@@ -317,6 +429,7 @@ class ArgumentData:
 
         update_counts(self.types, other.types)
         update_counts(self.tensor_dtypes, other.tensor_dtypes)
+        update_counts(self.tensor_devices, other.tensor_devices)
         update_counts(self.tensor_shapes, other.tensor_shapes)
         update_counts(self.tensor_values, other.tensor_values)
         update_counts(self.tuple_lengths, other.tuple_lengths)
@@ -340,8 +453,10 @@ class ArgumentData:
         if isinstance(a, torch.Tensor):
             sh = a.shape
             dt = a.dtype
+            dv = a.device
             self.tensor_shapes[sh] = self.tensor_shapes.get(sh, 0) + 1
             self.tensor_dtypes[dt] = self.tensor_dtypes.get(dt, 0) + 1
+            self.tensor_devices[dv] = self.tensor_devices.get(dv, 0) + 1
             self.tensor_values[a] = self.tensor_values.get(a, 0) + 1
 
             if len(sh) == 0:  # scalar
@@ -395,12 +510,16 @@ class ArgumentData:
                 raise NotImplementedError("Can't handle multiple tensor types yet")
             tensor_dtype = list(self.tensor_dtypes)[0]
 
+            if len(self.tensor_devices) > 1:
+                raise NotImplementedError("Can't handle multiple tensor devices yet")
+            tensor_device = list(self.tensor_devices)[0]
+
             shapes = TensorShapes()
 
             for sh,_ in self.tensor_shapes.items():
                 shapes.add(TensorShape(sh))
 
-            return wrapper(TensorArg(tensor_dtype, shapes))
+            return wrapper(TensorArg(tensor_dtype, tensor_device, shapes))
 
         elif issubclass(first_type, tuple):
             if len(self.tuple_lengths) > 1:
