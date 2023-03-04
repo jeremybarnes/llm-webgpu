@@ -5,7 +5,7 @@ import numpy as np
 from collections import namedtuple
 from typing import Any, List, Dict, Optional, Sequence, Tuple
 from torch import Tensor
-from introspect import short_dtype
+from utils import _short_dtype
 
 ATenValue = torch.Value
 
@@ -495,17 +495,6 @@ def choose_overload_for_aten(operator: str,
             print(json.dumps(m, indent=4))
         raise Exception('not finished: multiple viable overloads')
     
-
-
-def summarize_tensor(t: Tensor) -> str:
-    result = short_dtype(t.dtype) + '[' + ']['.join([str(s) for s in t.shape]) + ']'
-    nel = t.numel()
-    strt = str(t).replace('Parameter containing:\n', '').replace('tensor(', '').replace('\n', ' ')
-    if nel > 10:
-        return result + "=" + strt[0:50] + "..."
-    else:
-        return result + "=" + strt
-
 int_to_dtype_table = [
     torch.uint8,
     torch.int8,

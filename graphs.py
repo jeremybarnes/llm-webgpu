@@ -1,5 +1,5 @@
-from aten import int_to_dtype, dtype_to_int, int_to_memory_format, summarize_tensor
-
+from aten import int_to_dtype, dtype_to_int, int_to_memory_format
+from utils import summarize_tensor
 import torch
 from typing import Type, Tuple, Any, Dict, List, Optional, Generator, Callable, OrderedDict, Sequence, Mapping
 
@@ -13,30 +13,6 @@ from dataclasses import dataclass, field
 from ansi.color import bg, fg
 from ansi.color.fx import reset
 import traceback
-
-def _print_type(v: Any) -> str:
-    return str(type(v))
-
-def _print_value(v: Any) -> str:
-    def shorten(s: str) -> str:
-        if len(s) > 55:
-            s = s[0:50] + "..."
-        return s
-
-    if isinstance(v, (bool,int,float,type(None))):
-        return str(v)
-    elif isinstance(v, str):
-        return shorten('"' + str(v) + '"')
-    elif isinstance(v, list):
-        return shorten(str(v))
-    elif isinstance(v, Tensor):
-        return summarize_tensor(v)
-    elif isinstance(v, tuple):
-        return shorten('(' + ','.join([_print_value(v2) for v2 in v]) + ')')
-
-    else:
-        result = str(v).replace('\n,','')
-        return _print_type(v) + " " + result[0:50]
 
 Inputs = Tuple[Any, ...]
 NodeInterpreter = Callable[['Scope', Node],Any]

@@ -18,7 +18,8 @@ import struct
 import sys
 from scriptable_gpt_neo import GPTNeoForCausalLM
 
-from graphs import Scope, Operation, default_find_operation, _print_value as print_value
+from graphs import Scope, Operation, default_find_operation
+from utils import _print_value as print_value
 from torch._C import Graph, Node, dtype as cdtype
 from dataclasses import dataclass, field
 
