@@ -54,7 +54,7 @@ def optimize_script(script: ScriptModule, invocations: Invocations, info: Module
 
     scope = Scope(default_find_operation)
 
-    self_info = VariableInfo("self", Origin.SELF, is_const=True, const_value=invocations.m, const_type=type(invocations.m), produced=-1)
+    self_info = vars.constant(name="self", origin=Origin.SELF, value=invocations.m, produced=-1, produced_by=graph)
     vars.add(self_info)
     scope.add_var("self", invocations.m)
 
@@ -67,9 +67,9 @@ def optimize_script(script: ScriptModule, invocations: Invocations, info: Module
         if is_const:
             const_value = first(arg.values.keys())
             scope.add_var(name, const_value)
-            var_info = VariableInfo.constant(name=name, origin=Origin.ARG, value=const_value, produced_by=graph_input.node(), produced=-1)            
+            var_info = vars.constant(name=name, origin=Origin.ARG, value=const_value, produced_by=graph_input.node(), produced=-1)            
         else:
-            var_info = VariableInfo.argument(name=name, produced_by=graph_input.node(), observed=arg, torch_type=tp)
+            var_info = vars.argument(name=name, produced_by=graph_input.node(), observed=arg, torch_type=tp)
         vars.add(var_info)
         print("got input", i, var_info)
 

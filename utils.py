@@ -1,5 +1,12 @@
 import torch
-from typing import Any
+from typing import Any, TypeVar, Iterable, Optional
+
+VT = TypeVar("VT")
+
+def first(x: Iterable[VT]) -> Optional[VT]:
+    for v in x:
+        return v
+    return None
 
 def _short_dtype(dtype: torch.dtype):
     dtypes = {

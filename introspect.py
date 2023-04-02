@@ -173,13 +173,13 @@ class Invocations:
             print("param", name, param)
             samples = [c.args[i] for c in self.calls if i < len(c.args[i])]
             torch_type = _to_torch_type(param.annotation, samples)
-            result.args.append(ArgumentData(torch_type=torch_type))
+            result.args.append(ArgumentData(name=name,torch_type=torch_type))
 
         for k in all_kwargs:
             param = self.sig.parameters[k]
             samples = [c.kwargs.get(k) for c in self.calls if k in c.kwargs]
             torch_type = _to_torch_type(param.annotation, samples)
-            result.kwargs[k] = ArgumentData(torch_type=torch_type)
+            result.kwargs[k] = ArgumentData(name=k,torch_type=torch_type)
 
         for c in self.calls:
             for i in range(len(c.args)):
