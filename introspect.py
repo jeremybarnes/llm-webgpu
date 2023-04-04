@@ -12,7 +12,7 @@ from runtimes import print_elapsed
 from collections import defaultdict, OrderedDict
 from torch.utils.hooks import RemovableHandle
 from utils import _short_dtype, _print_value, _print_param, _print_value, typeify
-from variables import ArgumentData, _to_torch_type
+from variables import VariableInfo, Variables, _to_torch_type
 
 
 def introspect_model(m: Module):
@@ -34,7 +34,7 @@ def introspect_model(m: Module):
             print(f'{indent}    parameter {name} is {_print_param(param.shape, param.dtype, param.device)}')
 
         gotScripted = None
-        print_details = m._get_name() == "Embedding"
+        print_details = False #m._get_name() == "Embedding"
 
         try:
             scripted: RecursiveScriptModule = jit.script(m)
@@ -98,17 +98,17 @@ class Invocation:
 @dataclass
 class SummaryData:
     arg_lengths: Dict[int, int] = field(default_factory = dict)
-    args: List[ArgumentData] = field(default_factory = list)
-    kwargs: Dict[str, ArgumentData] = field(default_factory = dict)
+    args: List[VariableInfo] = field(default_factory = list)
+    kwargs: Dict[str, VariableInfo] = field(default_factory = dict)
 
     def print_args(self, indent: int = 0):
         ind = ' ' * indent
         for i in range(len(self.args)):
             arg = self.args[i]
-            print(f"{ind}{i}: {arg.summarize()}")
+            print(f"{ind}{i}: {arg}")
 
         for kw,arg in self.kwargs.items():
-            print(f"{ind}{kw}: {arg.summarize()}")
+            print(f"{ind}{kw}: {arg}")
 
     def add(self, other: 'SummaryData'):
         """
@@ -154,6 +154,7 @@ class Invocations:
         return f"Invocations(path={self.path} module={self.m._get_name()} runtime={print_elapsed(self.total_runtime())} ncalls={len(self.calls)} nchildren={len(self.children)})" # sig={inspect.signature(self.m.forward)})"
 
     def summarize(self) -> SummaryData:
+        vars = Variables()
         result = SummaryData()
 
         max_nargs = 0
@@ -172,30 +173,16 @@ class Invocations:
             name,param = ordered_params[i]
             print("param", name, param)
             samples = [c.args[i] for c in self.calls if i < len(c.args[i])]
+
             torch_type = _to_torch_type(param.annotation, samples)
-            result.args.append(ArgumentData(name=name,torch_type=torch_type))
+            result.args.append(vars.sampled(name=name, torch_type=torch_type, samples=samples, produced_by=None, produced=-1))
+            
 
         for k in all_kwargs:
             param = self.sig.parameters[k]
             samples = [c.kwargs.get(k) for c in self.calls if k in c.kwargs]
             torch_type = _to_torch_type(param.annotation, samples)
-            result.kwargs[k] = ArgumentData(name=k,torch_type=torch_type)
-
-        for c in self.calls:
-            for i in range(len(c.args)):
-                a = c.args[i]
-                ad = result.args[i]
-                name,param = ordered_params[i]
-                #print("param", name, param)
-                torch_type = _to_torch_type(param.annotation, [a])
-                ad.add(a, torch_type)
-
-            for k,a in c.kwargs.items():
-                #print("parameter", k)
-                param = self.sig.parameters[k]
-                torch_type = _to_torch_type(param.annotation, [a])
-                ad = result.kwargs[k]
-                ad.add(a, torch_type)
+            result.kwargs[k] = vars.sampled(name=k, torch_type=torch_type, samples=samples, produced_by=None, produced=-1)
 
         return result
 

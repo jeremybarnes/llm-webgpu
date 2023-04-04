@@ -1,5 +1,5 @@
 from typing import List, Tuple, Optional, Dict, Callable, Type, Sequence, Any, Iterable, TypeVar
-from variables import VariableInfo, Variables, Origin, TensorShape, TensorShapes, ShapeRange, TensorShapeVariable
+from variables import VariableInfo, Variables, Origin, TensorShapeVariable
 from utils import first
 from torch._C import Graph, Node
 from torch import Tensor, Value, Block

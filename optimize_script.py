@@ -7,8 +7,7 @@ from typing import Type, Tuple, Any, Dict, List, Optional, Generator, Callable, 
 from dataclasses import dataclass, field
 from introspect import (introspect_model, record_invocations, _short_dtype,
                         SummaryData, Invocation, Invocations)
-from variables import (ArgumentData, Arg, TensorArg, TensorShape, TensorShapes, ShapeRange,
-                       TupleArg, ListTupleArg, UnknownArg, ConstantArg, OptionalArg, VariableInfo, Variables, Origin, _to_torch_type)
+from variables import (VariableInfo, Variables, Origin, _to_torch_type)
 from graphs import Scope, default_find_operation, Operation
 from utils import _print_value
 from torch._C import Graph, Node, dtype as cdtype
