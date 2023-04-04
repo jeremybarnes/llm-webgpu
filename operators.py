@@ -405,13 +405,6 @@ class SequenceUnpackOperator(TorchFunctionOperator):
         elif input.sequence_length_is_const():
             assert input.sequence_const_length() == numoutputs
             return tuple(input)
-            def do_output(n: int) -> VariableInfo:
-                output = self.node.outputsAt(n)
-                el = input.seq_els[n]
-                assert el is not None
-                return el.renamed(output.debugName())
-
-            return tuple((do_output(n) for n in range(numoutputs)))
 
         else:
             raise RuntimeError("TODO SequenceUnpack const prop")
@@ -461,81 +454,6 @@ class AtenSizeOperator(TorchFunctionOperator):
 
         else:
             return sh
-
-        if input.const_type() == torch.Tensor:
-            shape = inputs[0].tensor_shape()
-
-            # fix up known_dim when it's negative (from the end)
-            if known_dim is not None and known_dim < 0:
-                known_dim += len(shape)
-
-            values: List[int] = []
-            all_const_values: bool = True
-            infos: List[VariableInfo] = []
-
-            for j,dim in enumerate(shape):
-                # If we know the dimension, extract it
-                if known_dim is not None and j != known_dim:
-                    continue
-                dim_name=output_name + f".{str(j)}"
-                if dim.is_const():
-                    values.append(dim.const_value())
-                    infos.append(vars.constant(name=dim_name, origin=Origin.CONST_PROP,
-                                                        value=dim.const_value(), produced_by=self.node, produced=produced))
-                else:
-                    all_const_values = False
-                    values.append(-1)
-                    infos.append(vars.local(name=dim_name, origin=Origin.CONST_PROP, tp=int,
-                                                    produced_by=self.node, produced=produced))
-
-            if one_dim:
-                print("known_dim", known_dim)
-                print("shape", shape)
-                print("infos", infos)
-                return infos[0]
-
-            if all_const_values:
-                return vars.constant(name=output_name, origin=Origin.CONST_PROP, value=values,
-                                                produced_by=self.node, produced=produced)
-            else:
-                print("values", values)
-                print("infos", infos)
-                return vars.inhomogeneous_sequence(name=output_name, origin=Origin.CONST_PROP, tp=list,
-                                                   values=infos, produced_by=self.node, produced=produced)
-
-        else:
-            print("input", input)
-            raise RuntimeError("TODO: non-tensor aten::size")
-
-
-        collected = self.collect_const_inputs(inputs)
-        if collected is not None:
-            # All inputs are constant, so we return a constant list
-            result = [value for name,value in collected.vars]
-            return VariableInfo.constant(name=output_name, origin=Origin.CONST_PROP, value=result,
-                                         produced_by=self.node, produced=produced)
-
-        else:
-            # Propagate what we know about the list
-            common_info: VariableInfo = copy.copy(inputs[0])
-            has_common_info = True
-            length = ShapeRange(len(inputs))
-
-            for j in range(1, len(inputs)):
-                other = inputs[j]    
-                if common_info.is_homogeneous(other):
-                    common_info.combine(other)
-                else:
-                    has_common_info = False
-                    break
-
-            if has_common_info:
-                return VariableInfo.homogeneous_sequence(name=output_name, origin=Origin.CONST_PROP, tp=list, length=length,
-                                                         values=common_info, produced_by=self.node, produced=produced)
-            else:
-                return VariableInfo.inhomogeneous_sequence(name=output_name, origin=Origin.CONST_PROP, tp=list,
-                                                           values=inputs, produced_by=self.node, produced=produced)
-
 
 @torch_operator('aten::__getitem__')
 class AtenGetItemOperator(TorchFunctionOperator):
@@ -637,7 +555,6 @@ class TorchTensorOperator(TorchFunctionOperator):
         """
         Child classes override this method to implement dtype calculations.
         """
-        result = None
         variables: List[VariableInfo] = []
         fixed: Optional[torch.device] = None
         for dtype in input_dtype:
@@ -1238,38 +1155,8 @@ class AtenViewOperator(TorchBuiltinOperator):
         new_shape = inputs[1]
         return new_shape
 
-        if new_shape.is_const():
-            # Constant shape... we know the output shape
-            assert isinstance(new_shape.const_value(), list)
-            print("new_shape", new_shape.const_type(), new_shape.const_value())
-            return new_shape
-        else:
-            seq_len = new_shape.sequence_length()
-            assert seq_len is not None
-            if seq_len.is_const():
-                l = seq_len.const_value()
-                if new_shape.seq_el is not None:
-                    # Homogeneous
-                    raise RuntimeError("TODO: homogeneous")
-                else:
-                    assert new_shape.seq_els is not None
-                    assert len(new_shape.seq_els) == l
-
-                    def get_dim(input: VariableInfo) -> ShapeRange:
-                        if input.is_const():
-                            return ShapeRange(input.const_value())
-                        else:
-                            return ShapeRange()
-
-                    dims = [get_dim(input) for input in new_shape.seq_els]
-                    dim_dict = { l: TensorShape(dims) }
-
-                    return TensorShapes(dim_dict)
-            else:
-                # Nothing known
-                return None
-
     def specialize_shape(self, output: Value, inputs: List[VariableInfo], input_shape: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
+        raise NotImplementedError()
         assert len(inputs) == 2
         if inputs[1].is_const():
             # Constant shape, we can return it
@@ -1306,11 +1193,6 @@ class AtenPermuteOperator(TorchBuiltinOperator):
             assert isinstance(new_order_val, list) or isinstance(new_order_val, tuple)
             new_shape = [old_shape[v] for v in new_order_val]
             return vars.tensor_shape(name=output.debugName()+".#shape", origin=Origin.CONST_PROP, dims=new_shape, produced_by=self.node, produced=produced)
-
-            new_shape_lens: Dict[int, TensorShape] = {}
-            for l in old_shape.lengths.values():
-                new_shape_lens[len(l)] = TensorShape()
-            return TensorShapes(new_shape_lens)
 
         else:
             # Non-const order; shape propagation terminates
@@ -1349,8 +1231,6 @@ class AtenTransposeOperator(TorchBuiltinOperator):
 
         return vars.tensor_shape(name=output.debugName()+".#shape", origin=Origin.CONST_PROP, dims=[old_shape[v] for v in new_order], produced_by=self.node, produced=produced)
 
-        return TensorShapes(new_shape_lens)
-
 @torch_operator('aten::contiguous')
 class AtenContiguousOperator(TorchBuiltinOperator):
     """
@@ -1373,7 +1253,6 @@ class AtenContiguousOperator(TorchBuiltinOperator):
         # ChannelsLast = 2
         # ChannelsLast3d = 3
         return input
-        raise RuntimeError(f"TODO: contiguous: non-default memory format {memfmt}")
         
 
 @torch_operator('aten::to')
@@ -1391,6 +1270,9 @@ class AtenToOperator(TorchBuiltinOperator):
         from aten import int_to_dtype, dtype_to_int, int_to_memory_format
         for input in inputs:
             print(input.name, input)
+
+        name=self.node.outputsAt(0).debugName()
+
         tensor = inputs[0]
         shape = tensor.tensor_shape()
         dtype: VariableInfo = inputs[0].tensor_dtype()
@@ -1409,7 +1291,7 @@ class AtenToOperator(TorchBuiltinOperator):
                 else:
                     # We get passed an int, we need to convert to a datatype
                     assert isinstance(inputs[1].const_value(), int)
-                    dtype = vars.constant(name="<<<unknown>>>", origin=Origin.CONST_PROP, value=int_to_dtype(inputs[1].const_value()),
+                    dtype = vars.constant(name=name, origin=Origin.CONST_PROP, value=int_to_dtype(inputs[1].const_value()),
                                             produced_by=self.node, produced=produced)
             offset = 2
             if device is None and inputs[2].const_type() != bool:
@@ -1418,7 +1300,7 @@ class AtenToOperator(TorchBuiltinOperator):
 
         # Rest are non_blocking, copy and memory_format which don't affect output tensor
 
-        return vars.tensor(name="<<<unknown>>>", origin=Origin.CONST_PROP, dtype=dtype, device=device,
+        return vars.tensor(name=name, origin=Origin.CONST_PROP, dtype=dtype, device=device,
                                    shape=shape, produced_by=self.node,produced=produced)
 
 @torch_operator('aten::slice')
@@ -1465,12 +1347,7 @@ class AtenSliceOperator(TorchBuiltinOperator):
 
             return vars.tensor_shape(name=output.debugName(), origin=Origin.CONST_PROP, dims=output_dims, produced_by=self.node, produced=produced)
 
-            input_dims.dims[dim_number.const_value()] = ShapeRange()
-            # TODO: could specialize more
-            return input_shape
-
         print("slice_copy: input_shapes", input_shapes)
-
         raise NotImplementedError()
 
     def fallback_const_prop(self, produced: int, inputs: List[VariableInfo], vars: Variables) -> Tuple[VariableInfo] | VariableInfo:
@@ -1505,10 +1382,7 @@ class AtenSliceOperator(TorchBuiltinOperator):
             else:
                 return vars.inhomogeneous_sequence(name=result.name, origin=Origin.CONST_PROP, tp=list, values=new_els, produced_by=self.node, produced=produced)
 
-            raise RuntimeError(f"TODO slice fallback_const_prop sequence {inputs[0]} {dim} {start} {end} {step} {result}")
-
-        raise RuntimeError(f"TODO slice fallback_const_prop sequence {result}")
-        return result
+        raise NotImplementedError(f"TODO slice fallback_const_prop sequence {result}")
 
 class TorchComparisonOperator(TorchBuiltinOperator):
     """
@@ -1599,7 +1473,7 @@ class DataTypeOperator(TorchBuiltinOperator):
         if inputs[0].tensor_dtype_is_const():
             dt = inputs[0].tensor_const_dtype()
             assert dt is not None
-            return vars.constant(name="<<<unknown>>>", origin=Origin.LOCAL, value=dtype_to_int(dt),
+            return vars.constant(name=self.node.outputsAt(0).debugName(), origin=Origin.LOCAL, value=dtype_to_int(dt),
                                          produced_by=self.node, produced=produced)
 
         # TODO: convert to int?
@@ -1618,10 +1492,10 @@ class ScalarTensorOperator(TorchBuiltinOperator):
         raise RuntimeError("scalar_tensor fallback_const_prop")
 
     def specialize_dtype(self, output: Value, inputs: List[VariableInfo], input_dtype: List[Optional[torch.dtype]]) -> Optional[torch.dtype]:
-        raise RuntimeError("scalar_tensor specialize_dtype")
+        raise NotImplementedError("scalar_tensor specialize_dtype")
 
     def specialize_shape(self, output: Value, inputs: List[VariableInfo], input_shape: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
-        return TensorShape([])
+        raise NotImplementedError("scalar_tensor specialize_shape")
 
 def broadcast_from(dim1: VariableInfo, dim2: VariableInfo, name: str, vars: Variables) -> VariableInfo:
     raise NotImplementedError()
@@ -1669,40 +1543,6 @@ def broadcast_dim(dim1: VariableInfo, dim2: VariableInfo, name: str, vars: Varia
     vars.unify(dim1, dim2)
 
     return dim1
-
-    raise NotImplementedError("non-const broadcast_dim")
-
-    def broadcast_one(dim: VariableInfo) -> VariableInfo:
-        # If it's dimension 1, it's broadcastable so we don't know the dimension
-        if dim.is_const():
-            if dim.const_value() == 1:
-                return None
-            else:
-                return dim
-        elif dim.min <= 1 and dim.max >= 1:
-            return None
-        else:
-            return dim
-
-    if dim1 is None:
-        if dim2 is None:
-            return None
-        else:
-            return broadcast_one(dim2)
-    else:
-        if dim2 is None:
-            return broadcast_one(dim1)
-        
-        # Both are non-null
-        if dim1.is_const() and dim1.const_value() == 1:
-            return dim2
-        elif dim2.is_const() and dim2.const_value() == 1:
-            return dim1
-        else:
-            result = copy.deepcopy(dim1)
-            result.broadcast_from(dim2)
-            return result
-
 
 def broadcast_shape2(shape1: List[int], shape2: List[int]) -> List[int]:
     max_len = max(len(shape1), len(shape2))
