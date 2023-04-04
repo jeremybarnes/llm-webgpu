@@ -236,7 +236,7 @@ def optimize_module(invocations: Invocations, dtype: torch.dtype, device: torch.
 
     for name,info in sorted(cache.optinfo.items()):
         print(f"module {name} has {len(info.invocations)} invocations with runtime {print_elapsed(info.total_runtime())}")
-        info.summary.print_args(8)
+        #info.summary.print_args(8)
         print()
 
     return _optimize_module(invocations, dtype, device, cache)

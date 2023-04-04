@@ -60,7 +60,10 @@ class TorchBlockOperator(TorchOperator):
 
         def process_block(block: Block) -> List[VariableInfo]:
             new_vars = vars.new_frame()
+            #print("exedcuting block", list(block.nodes()))
             const_prop_graph(block, new_vars)
+            #print("new_vars", new_vars)
+            new_vars.dump_vars('        ')
             return_node = block.returnNode()
             assert return_node.kind() == "prim::Return"
             assert return_node.inputsSize() == num_outputs
@@ -349,10 +352,11 @@ class SequenceIndexOperator(TorchFunctionOperator):
         if sequence.is_const() and index.is_const():
             return super().const_prop(i, inputs, vars)
 
-        if index.is_const():
+        if index.is_const() and sequence.sequence_length_is_const():
+            return sequence[index.const_value()]
             # We know the index.  Find the element.
             el = index.typed_const_nonnull_value(int)
-            if sequence.seq_els is not None and sequence.seq_el is None:
+            if sequence.seq_els is not None:
                 return sequence.seq_els[el]
             elif sequence.seq_els is None and sequence.seq_el is not None:
                 return sequence.seq_el
@@ -398,11 +402,12 @@ class SequenceUnpackOperator(TorchFunctionOperator):
                 return VariableInfo.constant(name=output.debugName(), origin=Origin.CONST_PROP, value=valn,produced_by=self.node,produced=produced)
 
             return tuple((do_output(n) for n in range(numoutputs)))
-        elif input.seq_length is not None and input.seq_length.is_const():
-            assert input.seq_length.const_value() == numoutputs
+        elif input.sequence_length_is_const():
+            assert input.sequence_const_length() == numoutputs
+            return tuple(input)
             def do_output(n: int) -> VariableInfo:
                 output = self.node.outputsAt(n)
-                el = input.seq_els[n] if input.seq_els is not None and n < len(input.seq_els) else input.seq_el
+                el = input.seq_els[n]
                 assert el is not None
                 return el.renamed(output.debugName())
 
