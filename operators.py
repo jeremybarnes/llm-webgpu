@@ -1,5 +1,5 @@
 from typing import List, Tuple, Optional, Dict, Callable, Type, Sequence, Any, Iterable, TypeVar
-from variables import VariableInfo, Variables, Origin, TensorShapeVariable
+from variables import VariableInfo, Variables, Origin, TensorShapeVariable, TorchOperator, get_torch_operator, torch_operator
 from utils import first
 from torch._C import Graph, Node
 from torch import Tensor, Value, Block
@@ -8,18 +8,8 @@ import copy
 import torch
 import operator
 import math
-
-
-class TorchOperator:
-
-    def is_block(self) -> bool: ...
-
-    # Is this a constant operation?  In other words, will it always return the same value
-    # given the same inputs, and doesn't have any side-effects?
-    def is_const(self) -> bool: ...
-
-    # Perform constant propagation for the operation
-    def const_prop(self, produced: int, inputs: List[VariableInfo], vars: Variables) -> Tuple[VariableInfo] | VariableInfo: ...
+import traceback
+from collections import OrderedDict
 
 
 class TorchBlockOperator(TorchOperator):
@@ -46,48 +36,71 @@ class TorchBlockOperator(TorchOperator):
         input = inputs[0]
         num_outputs = self.node.outputsSize()
 
-        results: List[VariableInfo] = []
-        
-        def do_result(results: List[VariableInfo], this_result: List[VariableInfo]):
-            print("do_result", this_result)
-            print("results", results)
-            if len(results) == 0:
-                results.extend(this_result)
-            else:
-                assert len(results) == len(this_result)
-                for res,this_res in zip(results, this_result):
-                    res.union(this_res)
+        results: List[List[VariableInfo]] = []
+        all_vars: List[Variables] = []
+        outputs: List[VariableInfo]
 
-        def process_block(block: Block) -> List[VariableInfo]:
+        def process_block(block: Block):
             new_vars = vars.new_frame()
-            #print("exedcuting block", list(block.nodes()))
+            print("exedcuting block", list(block.nodes()))
             const_prop_graph(block, new_vars)
             #print("new_vars", new_vars)
             new_vars.dump_vars('        ')
             return_node = block.returnNode()
             assert return_node.kind() == "prim::Return"
             assert return_node.inputsSize() == num_outputs
-            return [new_vars.renamed(new_vars.get(input.debugName(), produced), output.debugName()) for input,output in zip(return_node.inputs(),self.node.outputs())]
+
+            this_result = [new_vars.renamed(new_vars.get(input.debugName(), produced), output.debugName()) for input,output in zip(return_node.inputs(),self.node.outputs())]
+            results.append(this_result)
+            all_vars.append(new_vars)
 
         if not input.is_const():
             # It's not a constant.  Perform constant propagation for each block and take the
             # union of the outputs.
 
             for block in self.blocks:
-                do_result(results, process_block(block))
+                process_block(block)
+
+            all_keys: OrderedDict[str, List[VariableInfo]] = OrderedDict()
+
+            for block_vars in all_vars:
+                for name,info in block_vars.items():
+                    if name not in all_keys:
+                        all_keys[name] = []
+                    all_keys[name].append(info)
+
+            for key,infos in all_keys.items():
+                # Is this variable info in all of the branches?  If so, it's not optional
+                in_all = len(infos) == len(all_vars)
+                print("adding if variable", key, " from ", len(infos), " blocks", infos)
+                if in_all:
+                    vars.add_covering(infos, key, self.node, produced)
+                else:
+                    vars.add_optional(infos, key, self.node, produced)
+
+            # Deal with the outputs
+            combined_results = []
+            num_outputs = self.node.outputsSize()
+            for i in range(num_outputs):
+                this_res = [res[i] for res in results]
+                #print("output", i, "combining", this_res)
+                combined_results.append(vars.covering(this_res, self.node.outputsAt(i).debugName(), self.node, produced))
+                #print("got", combined_results[-1])
+
+            outputs = combined_results
 
         else:
             # It's a constant.  We do only one block.
             block_num = 0 if input.const_value() else 1
-            do_result(results, process_block(self.blocks[block_num]))
+            process_block(self.blocks[block_num])
+            outputs = results[0]
 
         if num_outputs == 0:
             return tuple()
         elif num_outputs == 1:
-            assert results[0] is not None
-            return results[0]
+            return outputs[0]
         else:
-            return tuple(results)
+            return tuple(outputs)
 
 class TorchFunctionOperator(TorchOperator):
     """
@@ -122,26 +135,6 @@ class TorchFunctionOperator(TorchOperator):
                 return None
 
         return scope        
-
-_torch_operators: Dict[Tuple[str,int], Callable[[Node],TorchOperator]] = {}
-
-def get_torch_operator(node: Node) -> TorchOperator:
-    arity = node.inputsSize()
-    print(f"getting operator {node.kind()} with arity {arity}")
-    key = (node.kind(), int(arity))
-    if key in _torch_operators:
-        return _torch_operators[key](node)
-    key = (node.kind(), -1)
-    return _torch_operators[key](node)
-
-def torch_operator(kind: str, arity: int = -1):
-    def do_operator(klass):
-        key = (kind,arity)
-        assert key not in _torch_operators
-        _torch_operators[key] = klass
-        return klass
-    return do_operator
-
 
 @torch_operator('aten::Param')
 class ParamOperator(TorchOperator):
@@ -259,14 +252,16 @@ class AtenIsOperator(TorchFunctionOperator):
         # Otherwise if values are known...
         if inputs[0].is_const() and inputs[1].is_const():
             val = inputs[0].const_value() is inputs[1].const_value()
-            print(f"const is: {inputs[0].const_value()} is {inputs[1].const_value()} = {val}")
-        elif inputs[1].const_type() == type(None) and inputs[1].const_type() == type(None):
+            #print(f"const is: {inputs[0].const_value()} is {inputs[1].const_value()} = {val}")
+        elif inputs[0].const_type() == type(None) and inputs[1].const_type() == type(None):
             # x is None can be short circuited based on types only
             val = True
-            print(f"const typed is: {inputs[0].const_type()} is {inputs[1].const_type()} = {val}")
+            #print("inputs[0] = ", inputs[0], inputs[0].const_type())
+            #print("inputs[1] = ", inputs[1], inputs[1].const_type())
+            #print(f"const none typed is: {inputs[0].const_type()} is {inputs[1].const_type()} = {val}")
 
         if val is not None:
-            print("invert is", self.invert, "val is", val)
+            #print("invert is", self.invert, "val is", val)
             if self.invert:
                 val = not val
             return vars.constant(name=self.node.outputsAt(0).debugName(), origin=Origin.CONST_PROP,
@@ -274,7 +269,7 @@ class AtenIsOperator(TorchFunctionOperator):
 
         # Otherwise, it's a boolean valued unknown
         return vars.local(name=self.node.outputsAt(0).debugName(), origin=Origin.LOCAL, tp=bool,
-                                  produced_by=self.node, produced=produced)
+                          produced_by=self.node, produced=produced)
 
 @torch_operator('aten::__isnot__')
 class AtenIsNotOperator(AtenIsOperator):
@@ -347,10 +342,12 @@ class SequenceIndexOperator(TorchFunctionOperator):
 
     def const_prop(self, produced: int, inputs: List[VariableInfo], vars: Variables) -> Tuple[VariableInfo] | VariableInfo:
         sequence,index = inputs
+        sequence = sequence.as_sequence()
+        index = index.as_int()
 
         # If both are constant, default behavior is fine
         if sequence.is_const() and index.is_const():
-            return super().const_prop(i, inputs, vars)
+            return super().const_prop(produced, inputs, vars)
 
         if index.is_const() and sequence.sequence_length_is_const():
             return sequence[index.const_value()]
@@ -399,7 +396,7 @@ class SequenceUnpackOperator(TorchFunctionOperator):
             def do_output(n: int) -> VariableInfo:
                 output = self.node.outputsAt(n)
                 valn = val[n]
-                return VariableInfo.constant(name=output.debugName(), origin=Origin.CONST_PROP, value=valn,produced_by=self.node,produced=produced)
+                return vars.constant(name=output.debugName(), origin=Origin.CONST_PROP, value=valn,produced_by=self.node,produced=produced)
 
             return tuple((do_output(n) for n in range(numoutputs)))
         elif input.sequence_length_is_const():
@@ -432,7 +429,7 @@ class AtenSizeOperator(TorchFunctionOperator):
     def is_const(self) -> bool: return True
 
     def const_prop(self, produced: int, inputs: List[VariableInfo], vars: Variables) -> Tuple[VariableInfo] | VariableInfo:
-        print(f"size with {self.node.inputsSize()} inputs and {self.node.outputsSize()} outputs")
+        #print(f"size with {self.node.inputsSize()} inputs and {self.node.outputsSize()} outputs")
         assert self.node.outputsSize() == 1
         assert self.node.inputsSize() == 1 or self.node.inputsSize() == 2
         one_dim: bool = self.node.inputsSize() == 2
@@ -521,7 +518,47 @@ class UninitializedOperator(TorchFunctionOperator):
             'FloatType': float,
         }
         result = result_types[return_type]()
-        return vars.constant(name="<<<unknown>>>", origin=Origin.CONST_PROP, value=result, produced_by=self.node, produced=produced)
+        return vars.constant(name=self.node.outputsAt(0).debugName(), origin=Origin.CONST_PROP, value=result, produced_by=self.node, produced=produced)
+
+@torch_operator('prim::unchecked_cast')
+class UninitializedOperator(TorchFunctionOperator):
+    """
+    Casts a value to a different type.
+    """
+
+    def is_const(self) -> bool: return True
+
+    def const_prop(self, produced: int, inputs: List[VariableInfo], vars: Variables) -> Tuple[VariableInfo] | VariableInfo:
+        input, = inputs
+
+        input_type = input.torch_type()
+        output_type = self.node.outputsAt(0).type()
+
+        if input.is_optional() and not isinstance(output_type, torch.OptionalType):
+            # Normally used to remove optional
+            input_str = input_type.getElementType().kind()
+            output_str = output_type.kind()
+
+            if input_str != output_str:
+                raise RuntimeError(f"Attempt to unchecked_cast optional {input_type} to incompatible {output_type}")
+            return input.non_optional().renamed(self.node.outputsAt(0).debugName())
+
+        if input_type.kind() == output_type.kind():
+            # Types are the same, we can just return it
+            return input.renamed(self.node.outputsAt(0).debugName())
+
+        # Check the type
+        print("input", input_type)
+        print("output", output_type)
+
+        raise NotImplementedError()
+        return_type = self.node.outputsAt(0).type()
+
+        result_types = {
+            'FloatType': float,
+        }
+        result = result_types[return_type]()
+        return vars.constant(name=self.node.outputsAt(0).debugName(), origin=Origin.CONST_PROP, value=result, produced_by=self.node, produced=produced)
 
 NodeOperator = Callable[..., Tuple[Any,...]|Any]
 _ops: Dict[str, List[Operation]] = {}
@@ -570,7 +607,8 @@ class TorchTensorOperator(TorchFunctionOperator):
                 variables.append(dtype)
 
         if fixed is not None:
-            vars.unify(fixed, *variables)
+            if len(variables) > 0:
+                vars.unify(fixed, *variables)
         else:
             vars.alias(*variables)
         
@@ -599,7 +637,8 @@ class TorchTensorOperator(TorchFunctionOperator):
                 variables.append(device)
 
         if fixed is not None:
-            vars.unify(fixed, *variables)
+            if len(variables) > 0:
+                vars.unify(fixed, *variables)
         else:
             vars.alias(*variables)
         
@@ -641,7 +680,7 @@ class TorchTensorOperator(TorchFunctionOperator):
         device: VariableInfo = self.specialize_device(output, [get_device(input) for input in inputs], produced, vars)
 
         def get_shape(input: VariableInfo) -> Optional[VariableInfo]:
-            print(f"get_shape for {input} is_tensor {input.is_tensor()}")
+            #print(f"get_shape for {input} is_tensor {input.is_tensor()}")
             if input.is_tensor():
                 return input.tensor_shape()
             elif issubclass(input.const_type(), (int,float)):
@@ -663,18 +702,18 @@ class TorchTensorOperator(TorchFunctionOperator):
 
         if jit_type.kind() == "TensorType":
             dtype,shape,device = self.specialize_tensor(output, inputs, produced, vars)
-            print("dtype", dtype)
-            print("shape", shape)
-            print("device", device)
+            #print("dtype", dtype)
+            #print("shape", shape)
+            #print("device", device)
             info = vars.tensor(name=output.debugName(), origin=Origin.LOCAL, produced_by=self.node, produced=produced,
                                dtype=dtype, shape=shape, device=device)
         elif jit_type.kind() == "ListType" or jit_type.kind() == "TupleType":
             elinfo,elsinfo,elen = self.specialize_sequence(produced, output, inputs, vars)
-            print("infer_variable_info for list")
-            print("inputs", inputs)
-            print("elinfo", elinfo)
-            print("elsinfo", elsinfo)
-            print("elen", elen)
+            #print("infer_variable_info for list")
+            #print("inputs", inputs)
+            #print("elinfo", elinfo)
+            #print("elsinfo", elsinfo)
+            #print("elen", elen)
             if elsinfo is None:
                 assert elinfo is not None
                 info = vars.homogeneous_sequence(name=output.debugName(), origin=Origin.LOCAL, produced_by=self.node,
@@ -786,19 +825,131 @@ class LinearOperator(TorchBuiltinOperator):
         if i_shape is None or w_shape is None:
             return None
         
-        print("i_shape", i_shape)
-        print("w_shape", w_shape)
+        #print("i_shape", i_shape)
+        #print("w_shape", w_shape)
 
         #mul_shape = _matmul_shape(i_shape,w_shape)
         assert i_shape is not None
         assert w_shape is not None
         b,m,n1=i_shape
         o,n2=w_shape
-        print("n1 = ", n1)
-        print("n2 = ", n2)
+        #print("n1 = ", n1)
+        #print("n2 = ", n2)
         vars.alias(n1, n2)
         #assert n1==n2
         return vars.tensor_shape(name=output.debugName()+"#shape", origin=Origin.CONST_PROP, dims=[b,m,o], produced=produced, produced_by=self.node)
+
+@torch_operator('aten::cat')
+class LinearOperator(TorchBuiltinOperator):
+    """
+    Concatenation operator.  Joins tensors together.
+    """
+    def specialize_shape(self, output: Value, inputs: List[VariableInfo], input_shape: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
+        input,dim = inputs
+
+        if dim.is_const():
+            d = dim.const_value()
+
+            if False:  # later, when we can do expressions
+                dim_width = vars.constant(name=output.debugName()+".#accum", origin=Origin.CONST_PROP, value=0, produced_by=self.node, produced=produced)
+                dims: List[List[VariableInfo]] = []
+
+                # First extract the shapes, and accumulate the given variable
+                for chunk in input.sequence_chunks():
+                    if chunk.is_sequence_chunk():
+                        shape = chunk.sequence_chunk_schema().tensor_shape()
+                        dim_width += shape[d] * chunk.sequence_length()
+                    else:
+                        shape = chunk.tensor_shape()
+                        dim_width += shape[d]
+                    if len(dims) == 0:
+                        dims = [[] for _ in range(len(shape))]
+                    assert len(shape) == len(dims)
+                    for i in range(len(shape)):
+                        dims[i].append(shape[i])
+            else:
+                dim_width: int = 0
+                all_const = True
+                dims: List[List[VariableInfo]] = []
+
+                # First extract the shapes, and accumulate the given variable
+                for chunk in input.sequence_chunks():
+                    if chunk.is_sequence_chunk():
+                        shape = chunk.sequence_chunk_schema().tensor_shape()
+                        this_dim = shape[d]
+                        if this_dim.is_const() and chunk.sequence_length_is_const():
+                            dim_width += this_dim.const_value() * chunk.sequence_const_length()
+                        else:
+                            all_const = False
+                    else:
+                        shape = chunk.tensor_shape()
+                        this_dim = shape[d]
+                        if this_dim.is_const():
+                            dim_width += this_dim.const_value()
+                        else:
+                            all_const = False
+
+                    if d < 0:
+                        d = len(shape) + d
+                    assert d >= 0
+
+                    if len(dims) == 0:
+                        dims = [[] for _ in range(len(shape))]
+                    assert len(shape) == len(dims)
+                    for i in range(len(shape)):
+                        dims[i].append(shape[i])
+
+                result: List[VariableInfo] = []
+
+                for i in range(len(dims)):
+                    if i == d:
+                        if all_const:
+                            print("all const")
+                            result.append(vars.constant(name=output.debugName()+".#dim"+str(i), origin=Origin.CONST_PROP, value=dim_width, produced_by=self.node, produced=produced))
+                        else:
+                            print("not all const")
+                            result.append(vars.local(name=output.debugName()+".#dim"+str(i), origin=Origin.CONST_PROP, tp=int, produced_by=self.node, produced=produced))
+                    else:
+                        # All of these dimensions must be equal
+                        print("wrong dim")
+                        result.append(vars.alias(*dims[i]))
+
+                    print("  doing dim", i, "(looking for", d, i==d, ") res", result[-1], "dim_width", dim_width)
+
+                print("dim", dim)
+                print("d", d)
+                print("dims", dims)
+                print("result", result)
+
+                shape_res = vars.tensor_shape(name=output.debugName(), origin=Origin.CONST_PROP, dims=result, produced_by=self.node, produced=produced)
+                print(shape_res)
+                return shape_res
+
+            raise NotImplementedError()
+        else:
+            raise NotImplementedError()
+
+        return vars.tensor_shape(name=output.debugName()+"#shape", origin=Origin.CONST_PROP, dims=[b,m,o], produced=produced, produced_by=self.node)
+
+    def specialize_dtype(self, output: Value, inputs: List[VariableInfo], input_dtype: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
+        input,_ = inputs
+        assert input.is_sequence()
+
+        # dtype must all be the same
+        dtypes: List[VariableInfo] = []
+
+        # First extract the dtypes
+        for chunk in input.sequence_chunks():
+            if chunk.is_sequence_chunk():
+                dtype = chunk.sequence_chunk_schema().tensor_dtype()
+            else:
+                dtype = chunk.tensor_dtype()
+            dtypes.append(dtype)
+
+        # And now unify them as they all must have the same value
+        vars.unify(*dtypes)
+
+        return dtypes[0]
 
 PythonBuiltinBinarySpecialization = Callable[['PythonBuiltinBinaryOperator',int,VariableInfo,VariableInfo,Variables],VariableInfo]
 
@@ -826,7 +977,7 @@ class PythonBuiltinBinaryOperator(TorchBuiltinOperator):
     def specialize_shape(self, output: Value, inputs: List[VariableInfo], input_shape: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
         # For tensor operations only.  Does the broadcasting.
         a_shape,b_shape = input_shape
-        print(f"specialize_shape: {a_shape} {self.op_str} {b_shape}")
+        #print(f"specialize_shape: {a_shape} {self.op_str} {b_shape}")
         assert a_shape is not None
         assert b_shape is not None
         return broadcast_shapes(a_shape, b_shape, name=output.debugName(), produced_by=self.node, produced=produced,vars=vars)
@@ -975,12 +1126,8 @@ class PythonBuiltinUnaryOperator(TorchBuiltinOperator):
     def specialize_shape(self, output: Value, inputs: List[VariableInfo], input_shape: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
         # For tensor operations only.  Does the broadcasting.
         a_shape, = input_shape
-        print(f"specialize_shape: {self.op_str} {a_shape}")
-        if a_shape is None:
-            # Can't know the shape of the output as broadcasting can cause all kinds of things to happen
-            return None  
-        else:
-            return a_shape
+        assert a_shape is not None
+        return a_shape
 
     def const_prop(self, produced: int, inputs: List[VariableInfo], vars: Variables) -> Tuple[VariableInfo] | VariableInfo:
         """
@@ -1097,12 +1244,12 @@ def _matmul_shape(a_shape: VariableInfo, b_shape: VariableInfo, name: str, produ
         else:
             m2,n2,b2 = b_shape[-2],b_shape[-1],list(b_shape[0:-2])
 
-        print(f"a: {b1} x {m1} x{n1}")
-        print(f"b: {b2} x {m2} x{n2}")
+        #print(f"a: {b1} x {m1} x{n1}")
+        #print(f"b: {b2} x {m2} x{n2}")
 
         n = broadcast_dim(n1, m2, name, vars)
 
-        print(f"out: {b2} x {m1} x {n2}")
+        #print(f"out: {b2} x {m1} x {n}")
 
         #    The non-matrix (i.e. batch) dimensions are broadcasted (and thus must be
         #    broadcastable). For example, if input is a (j×1×n×n)(j×1×n×n) tensor and other is a
@@ -1117,7 +1264,7 @@ def _matmul_shape(a_shape: VariableInfo, b_shape: VariableInfo, name: str, produ
         batch_dims = broadcast_shapes(result(b1), result(b2), name=name, produced_by=produced_by, produced=produced, vars=vars)
         dims = list(batch_dims)
         dims.extend([m1,n2])
-        print(f"returning {dims}")
+        #print(f"returning {dims}")
         return result(dims)
 
 @torch_operator('aten::matmul')
@@ -1126,10 +1273,10 @@ class MatMulOperator(TorchBuiltinOperator):
     Linear ax operator.
     """
     def specialize_shape(self, output: Value, inputs: List[VariableInfo], input_shape: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
-        print("input_shape", input_shape)
+        #print("input_shape", input_shape)
         a_shape,b_shape = input_shape
-        if a_shape is None or b_shape is None:
-            return None
+        assert a_shape is not None
+        assert b_shape is not None
         return _matmul_shape(a_shape, b_shape, output.debugName(), self.node, produced, vars)
 
 
@@ -1149,8 +1296,8 @@ class AtenViewOperator(TorchBuiltinOperator):
 
     def specialize_shapes(self, output: Value, inputs: List[VariableInfo], input_shapes: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
 
-        print("input_shape", input_shapes[0])
-        print("new_shape", inputs[1])
+        #print("input_shape", input_shapes[0])
+        #print("new_shape", inputs[1])
 
         new_shape = inputs[1]
         return new_shape
@@ -1185,8 +1332,8 @@ class AtenPermuteOperator(TorchBuiltinOperator):
         old_shape = input_shapes[0]
         new_order = inputs[1]
 
-        print("old_shape", old_shape)
-        print("new_order", new_order)
+        #print("old_shape", old_shape)
+        #print("new_order", new_order)
 
         if old_shape is not None and new_order.is_const():
             new_order_val = new_order.const_value()
@@ -1226,8 +1373,8 @@ class AtenTransposeOperator(TorchBuiltinOperator):
         new_order[dim1] = new_order[dim2]
         new_order[dim2] = tmp
 
-        print("old_shape", old_shape)
-        print("new_order", new_order)
+        #"old_shape", old_shape)
+        #print("new_order", new_order)
 
         return vars.tensor_shape(name=output.debugName()+".#shape", origin=Origin.CONST_PROP, dims=[old_shape[v] for v in new_order], produced_by=self.node, produced=produced)
 
@@ -1285,7 +1432,7 @@ class AtenToOperator(TorchBuiltinOperator):
             offset = 2
         else:
             if inputs[1].is_const():
-                print("to const value", inputs[1].const_value())
+                #print("to const value", inputs[1].const_value())
                 if isinstance(inputs[1].const_value(), torch.device):
                     device = inputs[1]
                 else:
@@ -1314,8 +1461,8 @@ class AtenSliceOperator(TorchBuiltinOperator):
 
     def specialize_shapes(self, output: Value, inputs: List[VariableInfo], input_shapes: List[Optional[VariableInfo]], produced: int, vars: Variables) -> VariableInfo:
 
-        for input in inputs:
-            print(f"input {input.name} {input.const_type()} {input}")
+        #for input in inputs:
+        #    print(f"input {input.name} {input.const_type()} {input}")
 
         input,dim_number,start,end,step = inputs
 
@@ -1332,7 +1479,7 @@ class AtenSliceOperator(TorchBuiltinOperator):
 
         sliced_dim: VariableInfo = input_shape[n]
 
-        print("sliced_dim: ", sliced_dim, "slice:", start, ":", end, ":", step)
+        #print("sliced_dim: ", sliced_dim, "slice:", start, ":", end, ":", step)
         if sliced_dim.is_const():
             if start.is_const() and end.is_const() and step.is_const():
                 raise NotImplementedError(f"slice of known dimension {sliced_dim} {start.const_value()}:{end.const_value()}:{step.const_value()}")
@@ -1358,13 +1505,16 @@ class AtenSliceOperator(TorchBuiltinOperator):
         if input.const_type() is not None and issubclass(input.const_type(), torch.Tensor):
             return result
 
-        if not result.is_const() and input.is_sequence() and input.const_type() is not None and issubclass(input.const_type(), list):
+        print("input", input)
+
+        if not result.is_const() and input.is_sequence():
+            input = input.as_sequence()
             # Specializing sequence... slicing a list with constant indices returns a slice of the VariableInfos
             start = inputs[1].typed_default_value(0)
             end = inputs[2].typed_const_value(int)
             step = inputs[3].typed_default_value(1)
 
-            print("start", start, "end", end, "step", step)
+            #print("start", start, "end", end, "step", step)
 
             if start is None or end is None or step is None:
                 return result
@@ -1372,7 +1522,7 @@ class AtenSliceOperator(TorchBuiltinOperator):
             old_els = list(input)
             new_els = list(old_els[start:end:step])
 
-            print("new_els", new_els)
+            #print("new_els", new_els)
 
             all_const = all(map(lambda x: x.is_const(), new_els))
             
@@ -1421,13 +1571,13 @@ class EmbeddingOperator(TorchBuiltinOperator):
         return weights_dtype
 
     def specialize_shape(self, output: Value, inputs: List[VariableInfo], input_shape: List[VariableInfo], produced: int, vars: Variables) -> VariableInfo:
-        print("inputs", inputs)
-        print("input_shape", input_shape)
+        #print("inputs", inputs)
+        #print("input_shape", input_shape)
 
         weights_shape,indexes_shape,_,_,_ = input_shape
 
-        print("weights_shape", weights_shape)
-        print("indexes_shape", indexes_shape)
+        #print("weights_shape", weights_shape)
+        #print("indexes_shape", indexes_shape)
 
         _,w_dim = weights_shape
         i_batch,i_len = indexes_shape
@@ -1506,7 +1656,7 @@ def broadcast_dim(dim1: VariableInfo, dim2: VariableInfo, name: str, vars: Varia
     are not compatible.
     """
 
-    print("broadcast_dim", name, dim1, dim2)
+    #print("broadcast_dim", name, dim1, dim2)
 
     if dim1.is_const() and dim2.is_const():
         val1 = dim1.const_value()
@@ -1532,8 +1682,8 @@ def broadcast_dim(dim1: VariableInfo, dim2: VariableInfo, name: str, vars: Varia
 
     # Typically, non-constant dimensions will not be 1 and so we won't get strange broadcasting behavior
 
-    print("dim1", dim1)
-    print("dim2", dim2)
+    #print("dim1", dim1)
+    #print("dim2", dim2)
 
     # if dim1 is 1, then dim2 can be whatever it wants
     # if dim2 is 1, then dim1 can be whatever it wants
@@ -1554,7 +1704,7 @@ def broadcast_shape2(shape1: List[int], shape2: List[int]) -> List[int]:
         newsh = [one_dim for _ in range(max_len - len(sh))]
         newsh.extend(sh)
 
-        print("do_shape", sh, newsh)
+        #print("do_shape", sh, newsh)
 
         for outsh,insh in zip(dims,newsh):
             outsh = broadcast_dim(outsh, insh, name, vars)
@@ -1562,7 +1712,7 @@ def broadcast_shape2(shape1: List[int], shape2: List[int]) -> List[int]:
     for sh in shapes:
         do_shape(sh)
 
-    print("broadcast_shape returning", dims)
+    #print("broadcast_shape returning", dims)
 
     return vars.tensor_shape(name=name, origin=Origin.CONST_PROP, dims=dims, produced_by=produced_by, produced=produced)
 
@@ -1590,7 +1740,7 @@ def broadcast_shape(shapes: Sequence[VariableInfo], name: str, produced_by: Opti
         raise RuntimeError("Cannot broadcast an empty set of shapes")
 
     max_len = max([len(s) for s in shapes])
-    print("max_len = ", max_len)
+    #print("max_len = ", max_len)
     one_dim = vars.constant(name="#dimpadding", origin=Origin.CONST_PROP, value=1, produced_by=produced_by, produced=produced)
     dims = [one_dim for _ in range(max_len)]
 
@@ -1598,7 +1748,7 @@ def broadcast_shape(shapes: Sequence[VariableInfo], name: str, produced_by: Opti
         newsh = [one_dim for _ in range(max_len - len(sh))]
         newsh.extend(sh)
 
-        print("do_shape", sh, newsh)
+        #print("do_shape", sh, newsh)
 
         for i,(outsh,insh) in enumerate(zip(dims,newsh)):
             dims[i] = broadcast_dim(outsh, insh, name, vars)
@@ -1606,7 +1756,7 @@ def broadcast_shape(shapes: Sequence[VariableInfo], name: str, produced_by: Opti
     for sh in shapes:
         do_shape(sh)
 
-    print("broadcast_shape returning", dims)
+    #print("broadcast_shape returning", dims)
 
     return vars.tensor_shape(name=name, origin=Origin.CONST_PROP, dims=dims, produced_by=produced_by, produced=produced)
 
@@ -1696,10 +1846,10 @@ class WhereOperator(TorchBuiltinOperator):
         assert right is not None
         sh = broadcast_shapes(cond, left, right, name=output.debugName()+".#shape",produced_by=self.node,produced=produced,vars=vars)
 
-        print("cond", cond)
-        print("left", left)
-        print("right", right)
-        print("shape", sh)
+        #print("cond", cond)
+        #print("left", left)
+        #print("right", right)
+        #print("shape", sh)
 
         return sh
 
@@ -1749,7 +1899,7 @@ def const_prop_graph(graph: Graph|Block, vars: Variables):
     start_at = [0]
     def do_node(produced: int, node: Node, indent: str):  # -> Tuple[Optional[Any|Tuple[Any]], bool]:
         try:
-            print(indent, "executing node", i, node)
+            #print(indent, "executing node", i, node)
 
             inputs: List[VariableInfo] = []
             for input in node.inputs():
@@ -1759,7 +1909,7 @@ def const_prop_graph(graph: Graph|Block, vars: Variables):
 
             op = get_torch_operator(node)
 
-            print("got op", op)
+            #print("got op", op)
 
             #print("before const prop", op)
             #vars.dump_vars(indent)
@@ -1798,9 +1948,10 @@ def const_prop_graph(graph: Graph|Block, vars: Variables):
 
             vars.dump_vars(indent, start_at[0])
             start_at[0] = len(vars)
-        except:
+        except Exception as e:
             print("exception executing node", node)
             vars.dump_vars(indent)
+            #traceback.print_exception(e)
             raise
 
 

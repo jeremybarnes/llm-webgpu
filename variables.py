@@ -1,15 +1,19 @@
 from enum import Enum
-from typing import Type, Tuple, Any, Dict, List, Optional, OrderedDict, Union, TypeVar, Iterator, Iterable, Sequence, SupportsInt, overload, get_origin, get_args, Callable, TypeAlias
+from typing import Type, Tuple, Any, Dict, List, Optional, OrderedDict, Union, TypeVar, Iterator, Iterable, Sequence, SupportsInt, overload, get_origin, get_args, Callable, TypeAlias, Set
 from dataclasses import dataclass, field
 import torch
 from torch._C import Node, Graph
 from utils import typeify, _print_value, _short_dtype, first
 from ansi.color import bg, fg
-from ansi.color.fx import reset
+from ansi.color.fx import reset  # pyright: ignore
 import copy
 import inspect
+from runtimes import print_elapsed
+from torch.nn import Module
+from tensor_comparisons import TensorDifference
+import operator
 
-TorchType: TypeAlias = 'torch._C.JitType'
+TorchType: TypeAlias = 'torch._C.JitType' # pyright: ignore
 
 def _is_optional(field):
     """
@@ -33,6 +37,10 @@ def _scalar_torch_type(tp: Type) -> TorchType:
         return torch.NoneType.get()
     elif issubclass(tp, str):
         return torch.StringType.get()
+    elif issubclass(tp, torch.device):
+        return torch.DeviceObjType.get()
+    elif issubclass(tp, torch.dtype):
+        return torch.IntType.get()
     raise NotImplementedError(f"_scalar_torch_type for {tp}")
 
 def _to_torch_type(ann: Any, samples: List[Any]) -> TorchType:
@@ -57,6 +65,8 @@ def _to_torch_type(ann: Any, samples: List[Any]) -> TorchType:
                         return torch.TensorType.create_from_tensor(sample)
                     elif sample is None:
                         return torch.NoneType.get()
+                    else:
+                        return _scalar_torch_type(type(sample))
 
                     raise RuntimeError(f"TODO: get_type {type(sample)}")
                 
@@ -99,6 +109,9 @@ def _to_torch_type(ann: Any, samples: List[Any]) -> TorchType:
 
     raise RuntimeError(f"_to_torch_type for {ann} {get_origin(ann)} {get_args(ann)}")
 
+def _common_torch_type(*types: TorchType) -> TorchType:
+    raise NotImplementedError()
+
 class Origin(Enum):
     UNKNOWN = 0
     SELF = 1
@@ -107,6 +120,7 @@ class Origin(Enum):
     LOCAL = 4
     CONST_PROP = 5
     SAMPLE = 6
+    EXPRESSION = 7
 
 Tp = TypeVar('Tp')
 
@@ -117,6 +131,11 @@ class VariableInfo:
     name: str = ""
     owner: 'Variables'
     origin: Origin = Origin.UNKNOWN
+
+    def _as_type(self, t: Type[Tp]) -> Tp:
+        if not isinstance(self, t):
+            raise RuntimeError(f"Attempt to convert to {t.__name__} {type(self).__name__} {self}")
+        return self
 
     def print_value(self) -> str:
         raise RuntimeError(f"Must override print_value() for class {type(self).__name__}")
@@ -144,6 +163,9 @@ class VariableInfo:
 
     def is_optional(self) -> bool:
         return False
+
+    def non_optional(self) -> 'VariableInfo':
+        raise RuntimeError(f"Must override non_optional() type {type(self)}")
 
     def is_tensor(self) -> bool:
         return False
@@ -173,6 +195,24 @@ class VariableInfo:
         if self.is_sequence():
             raise RuntimeError(f"Must override if is_sequence() can be true for type {type(self)}")
         raise RuntimeError(f"Attempt to call non-sequence type {type(self).__name__} {self}")
+
+    def sequence_chunks(self) -> Iterator['VariableInfo']:
+        """
+        Returns a list of either elements or sequence chunks, or order, that together makes up the sequence's
+        known and unknown elements.  This will always succeed on all sequences, not matter whether the length
+        is known or not.
+        """
+        if self.is_sequence():
+            raise RuntimeError(f"Must override if is_sequence() can be true for type {type(self)}")
+        raise RuntimeError(f"Attempt to call non-sequence type {type(self).__name__} {self}")
+
+    def sequence_chunk_schema(self) -> 'VariableInfo':
+        """
+        For sequence chunks (which may be of non-unitary length), returns the schema of the elements.
+        """
+        if self.is_sequence_chunk():
+            raise RuntimeError(f"Must override if is_sequence_chunk() can be true for type {type(self)}")
+        raise RuntimeError(f"Attempt to call non-sequence-chunk type {type(self).__name__} {self}")
 
     def element_type_is_const(self) -> bool:
         if self.is_sequence():
@@ -212,13 +252,37 @@ class VariableInfo:
         """
         raise RuntimeError(f"Attempt to call const_device() for non-tensor type {type(self).__name__} {self}")
 
-    def tensor_shape(self) -> 'VariableInfo':
+    def tensor_shape(self) -> 'TensorShapeVariable':
         """
         Returns the variable containing the shape of this tensor.
         """
         if self.is_tensor():
             raise RuntimeError(f"Must override tensor_shape() if is_tensor() can be true for type {type(self)}")
         raise RuntimeError(f"Attempt to call tensor_shape() for non-tensor type {type(self).__name__} {self}")
+
+    def is_scalar(self) -> bool:
+        return False
+    
+    def as_sequence(self) -> 'SequenceVariable': return self._as_type(SequenceVariable)
+    def as_tensor(self) -> 'TensorVariable': return self._as_type(TensorVariable)
+    def as_scalar(self) -> 'ScalarVariable': return self._as_type(ScalarVariable)
+    def as_int(self) -> 'IntVariable': return self._as_type(IntVariable)
+    def as_float(self) -> 'FloatVariable': return self._as_type(FloatVariable)
+    def as_device(self) -> 'DeviceVariable': return self._as_type(DeviceVariable)
+    def as_data_type(self) -> 'DataTypeVariable': return self._as_type(DataTypeVariable)
+    def as_shape(self) -> 'TensorShapeVariable': return self._as_type(TensorShapeVariable)
+
+
+    def observe(self, observed: List[Any]) -> 'VariableInfo':
+        """
+        Provide feedback that the given value was observed during execution, for
+        profile-guided optimization.  This may mutate it in place.
+        """
+        raise RuntimeError(f"Must override observe() for class {type(self).__name__}")
+
+    @staticmethod
+    def covering(vars: 'Variables', name: str, produced_by: Optional[Node|Graph], produced: int, infos: Sequence['VariableInfo']) -> 'VariableInfo':
+        raise RuntimeError(f"Need to implement covering for types {infos}")
 
     # Which node produced, and which nodes read, this value.  The integers are the sequence
     # of nodes in the graph.
@@ -279,83 +343,48 @@ class VariableInfo:
         mutable.
         """
         raise RuntimeError(f"TODO: duplicate() for {type(self)}")
-        result = copy.copy(self)
-        if self.seq_els is not None:
-            result.seq_els = [el.deepcopy() for el in self.seq_els]
-        if self.seq_length is not None:
-            result.seq_length = copy.copy(self.seq_length)
-        if self.tensor_shape is not None:
-            result.tensor_shape = copy.deepcopy(self.tensor_shape)
-        return result
 
     def renamed(self, new_name: str) -> 'VariableInfo':
         res = self.duplicate()
         res.name = new_name
         return res
 
-    def is_homogeneous(self, other: 'VariableInfo'):
-        """
-        Are these homogeneous, meaning that they can be combined into a single
-        VariableInfo that covers both of them.
-        """
-        if self.const_type() != other.const_type():
-            return False
-        if self.is_const() and other.is_const():
-            return self.const_value() == other.const_value()
-        if self.const_type() == torch.Tensor:
-            type1 = self.const_dtype()
-            type2 = other.const_dtype()
+    def __add__(self, other) -> 'VariableInfo':
+        return self.owner.expression('aten::add',)
+        raise NotImplementedError()
 
-            if type1 != type2:
-                # TODO: they may be homogeneous; there may be a type that covers both
-                return False
+class TorchOperator:
 
-            device1 = self.const_device
-            device2 = other.const_device
+    def is_block(self) -> bool: ...
 
-            if device1 != device2:
-                return False
+    # Is this a constant operation?  In other words, will it always return the same value
+    # given the same inputs, and doesn't have any side-effects?
+    def is_const(self) -> bool: ...
 
-            return True
-        elif self.const_type() == tuple or self.const_type() == list:
-            raise RuntimeError("is_homogeneous for sequence")
+    # Perform constant propagation for the operation
+    def const_prop(self, produced: int, inputs: List[VariableInfo], vars: 'Variables') -> Tuple[VariableInfo] | VariableInfo: ...
 
-        return True
+_torch_operators: Dict[Tuple[str,int], Callable[[Node],TorchOperator]] = {}
 
-    def combine(self, other: 'VariableInfo') -> 'VariableInfo':
-        """
-        Combine the two VariableInfos together to create one that covers both.
-        """
-        raise RuntimeError(f"need to implement combine() on {type(self).__name__}")
+def get_torch_operator(node: Node) -> TorchOperator:
+    arity = node.inputsSize()
+    #print(f"getting operator {node.kind()} with arity {arity}")
+    key = (node.kind(), int(arity))
+    if key in _torch_operators:
+        return _torch_operators[key](node)
+    key = (node.kind(), -1)
+    return _torch_operators[key](node)
 
-        raise NotImplementedError(f"combine(): {self} with {other}")
+def torch_operator(kind: str, arity: int = -1):
+    def do_operator(klass):
+        key = (kind,arity)
+        assert key not in _torch_operators
+        _torch_operators[key] = klass
+        return klass
+    return do_operator
 
-        if other.is_optional:
-            self.is_optional = True
 
-        if other.const_type() != self.const_type():
-            raise RuntimeError("TODO: combine with two different types")
-
-        if self.is_const() and not other.is_const():
-            self.const_value = None
-            self.is_const = False
-
-        if self.const_type() == torch.Tensor:
-            if self.const_dtype != other.const_dtype:
-                self.const_dtype = None
-            if self.const_device != other.const_device:
-                self.const_device = None
-            if other.tensor_shape() is not None and self.tensor_shape() is not None:
-                for sh in other.tensor_shape().lengths.values():
-                    self.tensor_shape().add(sh)
-        elif self.const_type() == tuple or self.const_type() == list:
-            raise RuntimeError("TODO: combine sequences")
-
-        self.produced = min(self.produced, other.produced)
-        self.first_consumed = min(self.first_consumed, other.first_consumed)
-        self.last_consumed = max(self.last_consumed, other.last_consumed)
-
-class ConstantVariable(VariableInfo):
+class ___ConstantVariable(VariableInfo):
     # Anything which is constant
 
     value: Any
@@ -445,85 +474,335 @@ class ConstantVariable(VariableInfo):
 
     def duplicate(self) -> VariableInfo: return ConstantVariable(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
 
-    def combine(self, other: 'VariableInfo') -> 'VariableInfo':
-        type1 = self.const_type()
-        type2 = other.const_type()
-        if type1 != type2:
-            raise NotImplementedError(f"combine differing types {type1} {type2}")
+    def observe(self, observed: List[Any]) -> VariableInfo:
+        for o in observed:
+            if id(o) == id(self.value):
+                continue
+            if isinstance(o, torch.Tensor):
+                diff = TensorDifference.between(o, self.value)
+                if diff:
+                    raise RuntimeError(f"observed tensor differs from const prop: ulps {diff.ulps}: {_print_value(o)} vs {_print_value(self.value)}")
+            else:
+                if o != self.value:
+                    raise RuntimeError(f"observed constant {o} differs from const prop {self.value}")
+        return self
 
-        if isinstance(other, ConstantVariable):
-            raise NotImplementedError(f"combine {self} {other}")
-        elif isinstance(other, ScalarVariable):
-            return other.duplicate()
-        else:
-            raise NotImplementedError(f"combine {self} {other}")
+    def __add__(self, other) -> 'VariableInfo':
+        res = self.value + other
+        if isinstance(res, VariableInfo):
+            return res
+        return ConstantVariable(name=f"#add({self.name}{other.name})", owner=self.owner, origin=Origin.EXPRESSION, produced_by=None,produced=-1,value=res)
 
-class TensorVariable(VariableInfo):
-    # The following are for Tensors.  We model the data type, device and shape separately.
-    dtype: VariableInfo
-    device: VariableInfo
-    shape: VariableInfo
+    def __radd__(self, other) -> 'VariableInfo':
+        res = other + self.value
+        if isinstance(res, VariableInfo):
+            return res
+        return ConstantVariable(name=f"#add({self.name}{other.name})", owner=self.owner, origin=Origin.EXPRESSION, produced_by=None,produced=-1,value=res)
+
+class NoneVariable(VariableInfo):
+    """
+    A variable of type None.  Since the value is singular, it's both const and acts without a value.
+    """
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int):
+        super().__init__(name, owner, origin, produced_by,produced)
+
+    def __repr__(self) -> str: return f"{self.name}:  None"
+    def print_value(self) -> str: return f"None"
+    def is_const(self) -> bool: return True
+    def const_value(self) -> Any: return None
+    def const_type(self) -> Type: return type(None)
+    def torch_type(self) -> TorchType: return torch.NoneType.get()
+    def duplicate(self) -> 'VariableInfo': return NoneVariable(name=self.name, owner=self.owner, origin=self.origin, produced_by=self.produced_by, produced=self.produced)
+    def observe(self, observed: List[Any]) -> 'NoneVariable':
+        for o in observed:
+            if o is not None:
+                raise RuntimeError(f"Non-None value {o} observed in None context")
+        return self
+
+class ScalarVariable(VariableInfo):
+    # Anything which is a scalar value with a known type
+
+    type: Type
 
     def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
-                 dtype: VariableInfo, device: VariableInfo, shape: VariableInfo):
+                 type: Type):
+        assert not issubclass(type, torch.Tensor)
         super().__init__(name, owner, origin, produced_by,produced)
-        assert issubclass(dtype.const_type(), torch.dtype)
-        assert issubclass(device.const_type(), torch.device)
-        print("shape", shape)
-        assert shape.is_sequence()
-        self.dtype = dtype
-        self.device = device
-        self.shape = shape
+        self.type = type
 
-    def __repr__(self) -> str:
-        return f"{self.name}: tensor {_print_tensor_info(self)}"
-
-    def print_value(self) -> str: return _print_tensor_info(self)
-    def const_type(self) -> type: return torch.Tensor
-    def torch_type(self) -> TorchType: raise NotImplementedError()  # TODO
+    def __repr__(self) -> str: return f"{self.name}:  {self.print_value()}"
+    def print_value(self) -> str:
+        result = f"<{self.type.__name__}"
+        if self.is_const():
+            result += "=" + str(self.const_value())
+        result += ">"
+        return result
     def is_const(self) -> bool: return False
-    def is_tensor(self) -> bool: return True
-    def tensor_dtype(self) -> VariableInfo: return self.dtype
-    def tensor_device(self) -> VariableInfo: return self.device
-    def tensor_const_dtype(self) -> Optional[torch.dtype]:
-        if self.dtype.is_const():
-            return self.dtype.const_value()
-        return None
-    def tensor_const_device(self) -> Optional[torch.device]:
-        if self.device.is_const():
-            return self.device.const_value()
-        return None
-    def tensor_shape(self) -> VariableInfo: return self.shape
-
-    def duplicate(self) -> VariableInfo:
-        return TensorVariable(name=self.name, owner=self.owner, origin=self.origin, produced_by=self.produced_by,
-                                produced=self.produced, dtype=self.dtype.duplicate(), device=self.device.duplicate(), shape=self.shape.duplicate())
+    def const_type(self) -> Type: return self.type
+    def torch_type(self) -> TorchType: return _scalar_torch_type(self.type)
+    def is_tensor(self) -> bool: return False
 
     @staticmethod
-    def sampled(name: str, tp: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'VariableInfo':
+    def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'VariableInfo':
 
-        val_counts: Dict[Any, int] = {}
+        type_samples: Dict[type, List[Any]] = {}
         for v in samples:
-            if v in val_counts:
-                val_counts[v] += 1
+            t = type(v)
+            if t in type_samples:
+                type_samples[t].append(v)
             else:
-                val_counts[v] = 1
+                type_samples[t] = [v]
 
-        tensor_dtypes: List[torch.dtype] = []
-        tensor_devices: List[torch.device] = []
-        tensor_shapes: List[List[int]] = []
+        if len(type_samples) > 1:
+            print("type_samples", type_samples)
+            raise NotImplementedError("multiple types")
 
-        for s in samples:
-            assert isinstance(s, torch.Tensor)
-            tensor_dtypes.append(s.dtype)
-            tensor_devices.append(s.device)
-            tensor_shapes.append(list(s.shape))
+        for t,s in type_samples.items():
+            if t == int:
+                return IntVariable.sampled(name, torch_type, s, produced_by, produced, vars)
+            elif t == torch.dtype:
+                return DataTypeVariable.sampled(name, torch_type, s, produced_by, produced, vars)
+            elif t == torch.device:
+                return DeviceVariable.sampled(name, torch_type, s, produced_by, produced, vars)
+            raise NotImplementedError("scalar of type", t)
 
-        dtype = vars.sampled(name=name+".#dtype", torch_type=torch.IntType.get(), samples=tensor_dtypes, produced_by=produced_by, produced=produced)
-        device = vars.sampled(name=name+".#device", torch_type=torch.DeviceObjType.get(), samples=tensor_devices, produced_by=produced_by, produced=produced)
-        shape = TensorShapeVariable.sampled(name=name+".#shape", torch_type=torch.ListType(torch.IntType.get()), samples=tensor_shapes, produced_by=produced_by, produced=produced, vars=vars)
+        raise NotImplementedError()
 
-        return vars.tensor(name=name, origin=Origin.SAMPLE, dtype=dtype, device=device, shape=shape, produced_by=produced_by, produced=produced)
+    def observe(self, observed: List[Any]) -> 'ScalarVariable':
+        for o in observed:
+            assert isinstance(o, self.type)
+        return self
+
+class IntVariable(ScalarVariable):
+
+    min_value: Optional[int] = None
+    max_value: Optional[int] = None
+
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 min_value: Optional[int] = None, max_value: Optional[int] = None):
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, type=int)
+        self.min_value = min_value
+        self.max_value = max_value
+
+    def __repr__(self) -> str: return f"{self.name}:  {self.print_value()}"
+    def print_value(self) -> str:
+        result = "int"
+        if self.min_value is not None or self.max_value is not None:
+            if self.min_value == self.max_value:
+                result += "=" + str(self.min_value)
+            else:
+                result += "{"
+                if self.min_value is not None:
+                    result += str(self.min_value)
+                result += ":"
+                if self.max_value is not None:
+                    result += str(self.max_value)
+                result += "}"
+        return result
+
+    def const_value(self) -> int: return super().const_value()
+
+    def duplicate(self) -> VariableInfo: return IntVariable(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,min_value=self.min_value,max_value=self.max_value)
+
+    @staticmethod
+    def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> VariableInfo:
+        min_value = min(samples)
+        max_value = max(samples)
+        assert isinstance(torch_type, torch.IntType)
+        return IntVariable(name=name, owner=vars, origin=Origin.SAMPLE, produced_by=produced_by, produced=produced, min_value=min_value, max_value=max_value)
+
+    def observe(self, observed: List[Any]) -> 'IntVariable':
+        for o in observed:
+            if not isinstance(o, int):
+                raise RuntimeError(f"observed value {o} of type {type(o).__name__} when looking for int {self}")
+            assert isinstance(o, int)
+            if self.min_value is not None and o < self.min_value:
+                raise RuntimeError(f"observed incompatible value {o} for {self}")
+            if self.max_value is not None and o > self.max_value:
+                raise RuntimeError(f"observed incompatible value {o} for {self}")
+        # TODO: record observation?
+        return self
+
+    @staticmethod
+    def covering(vars: 'Variables', name: str, produced_by: Optional[Node|Graph], produced: int, infos: Sequence['VariableInfo']) -> 'IntVariable':
+        assert isinstance(infos[0], IntVariable)
+        min_value: Optional[int] = infos[0].min_value
+        max_value: Optional[int] = infos[0].max_value
+        for i in infos:
+            assert isinstance(i, IntVariable)
+            min_value = None if i.min_value is None or min_value is None else min(i.min_value, min_value)
+            max_value = None if i.max_value is None or max_value is None else max(i.max_value, max_value)
+            print("covering int variable", i, "min_value", min_value, "max_value", max_value)
+
+        return IntVariable(name=name, owner=vars, origin=Origin.CONST_PROP, produced_by=produced_by, produced=produced, min_value=min_value, max_value=max_value)
+
+    def __add__(self, other) -> 'VariableInfo':
+        return self.owner.expression(op="aten::add", args=[self, other], name=self.name + "#__add__", origin=self.origin, produced_by=None, produced=-1)
+
+    def __radd__(self, other) -> 'VariableInfo':
+        res = other + self.value
+        if isinstance(res, VariableInfo):
+            return res
+        return ConstantVariable(name=f"#add({self.name}{other.name})", owner=self.owner, origin=Origin.EXPRESSION, produced_by=None,produced=-1,value=res)
+
+def _observe_constant(self: Tp, observed: List[Any]) -> Tp:
+    for o in observed:
+        if o != self.value: # pyright: ignore
+            raise RuntimeError("observed value {o} incompatible with constant {self}")
+    return self
+
+class ConstantInt(IntVariable):
+    value: int
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: int):
+        self.value = value
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, min_value=value, max_value=value)
+
+    def is_const(self) -> bool: return True
+    def const_value(self) -> int: return self.value
+    def duplicate(self) -> VariableInfo: return ConstantInt(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
+    def observe(self, observed: List[Any]) -> 'ConstantInt': return _observe_constant(self, observed)
+
+class FloatVariable(ScalarVariable):
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int):
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, type=float)
+
+    def duplicate(self) -> 'FloatVariable': return copy.copy(self)
+    def observe(self, observed: List[Any]) -> 'FloatVariable':
+        result = super().observe(observed)
+        assert isinstance(result, FloatVariable)
+        return result
+
+    @staticmethod
+    def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'FloatVariable':
+        assert isinstance(torch_type, torch.FloatType)
+        return FloatVariable(name=name, owner=vars, origin=Origin.SAMPLE, produced_by=produced_by, produced=produced)
+
+class ConstantFloat(FloatVariable):
+    value: float
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: float):
+        self.value = value
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced)
+    def is_const(self) -> bool: return True
+    def const_value(self) -> float: return self.value
+    def duplicate(self) -> 'ConstantFloat': return copy.copy(self)
+    def observe(self, observed: List[Any]) -> 'ConstantFloat': return _observe_constant(self, observed)
+
+class StringVariable(ScalarVariable):
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int):
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, type=str)
+    def duplicate(self) -> 'StringVariable': return copy.copy(self)
+    def observe(self, observed: List[Any]) -> 'StringVariable':
+        result = super().observe(observed)
+        assert isinstance(result, StringVariable)
+        return result
+
+    @staticmethod
+    def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'StringVariable':
+        assert isinstance(torch_type, torch.StringType)
+        return StringVariable(name=name, owner=vars, origin=Origin.SAMPLE, produced_by=produced_by, produced=produced)
+
+class ConstantString(StringVariable):
+    value: str
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: str):
+        self.value = value
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced)
+    def is_const(self) -> bool: return True
+    def const_value(self) -> str: return self.value
+    def duplicate(self) -> 'ConstantString': return copy.copy(self)
+    def observe(self, observed: List[Any]) -> 'ConstantString': return _observe_constant(self, observed)
+
+class BooleanVariable(ScalarVariable):
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int):
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, type=bool)
+
+    def duplicate(self) -> 'BooleanVariable': return copy.copy(self)
+    def observe(self, observed: List[Any]) -> 'BooleanVariable':
+        result = super().observe(observed)
+        assert isinstance(result, BooleanVariable)
+        return result
+
+    @staticmethod
+    def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'BooleanVariable':
+        assert isinstance(torch_type, torch.FloatType)
+        return BooleanVariable(name=name, owner=vars, origin=Origin.SAMPLE, produced_by=produced_by, produced=produced)
+
+class DataTypeVariable(ScalarVariable):
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int):
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, type=torch.dtype)
+
+    def duplicate(self) -> 'DataTypeVariable': return copy.copy(self)
+    def observe(self, observed: List[Any]) -> 'DataTypeVariable':
+        result = super().observe(observed)
+        assert isinstance(result, DataTypeVariable)
+        return result
+
+class ConstantDataType(DataTypeVariable):
+    value: torch.dtype
+
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: torch.dtype):
+        self.value = value
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced)
+
+    def is_const(self) -> bool: return True
+    def const_value(self) -> torch.dtype: return self.value
+    def duplicate(self) -> VariableInfo: return ConstantDataType(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
+    def observe(self, observed: List[Any]) -> 'ConstantDataType': return _observe_constant(self, observed)
+
+class DeviceVariable(ScalarVariable):
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int):
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, type=torch.device)
+
+    def duplicate(self) -> VariableInfo: return copy.copy(self)
+    def observe(self, observed: List[Any]) -> 'DeviceVariable':
+        result = super().observe(observed)
+        assert isinstance(result, DeviceVariable)
+        return result
+
+    @staticmethod
+    def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'DeviceVariable':
+        assert isinstance(torch_type, torch.DeviceObjType)
+        return DeviceVariable(name=name, owner=vars, origin=Origin.SAMPLE, produced_by=produced_by, produced=produced)
+
+class ConstantDevice(DeviceVariable):
+    value: torch.device
+
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: torch.device):
+        self.value = value
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced)
+
+    def is_const(self) -> bool: return True
+    def const_value(self) -> torch.device: return self.value
+    def duplicate(self) -> VariableInfo: return type(self)(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
+    def observe(self, observed: List[Any]) -> 'ConstantDevice': return _observe_constant(self, observed)
+
+class ConstantValue(ScalarVariable):
+    """
+    Used for any value which doesn't match one of the other types
+    """
+    value: Any
+
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: torch.device):
+        self.value = value
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, type=type(value))
+
+    def is_const(self) -> bool: return True
+    def const_value(self) -> Any: return self.value
+    def duplicate(self) -> VariableInfo: return type(self)(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
+
+    def observe(self, observed: List[Any]) -> 'ConstantValue':
+        for o in observed:
+            if id(o) == id(self.value):
+                continue
+            if o != self.value:
+                raise RuntimeError("Specialized type {self} observed non-compatible value {o}")
+
+        return self
 
 class SequenceChunk(VariableInfo):
     # This is a variable length chunk of unknown elements, each of which has a schema
@@ -558,6 +837,8 @@ class SequenceVariable(VariableInfo):
         self.tp = tp
         self.seq_els = seq_els
 
+    def __repr__(self) -> str: return f"{self.name}:  {self.print_value()}"
+
     def print_value(self) -> str:
         brackets = "<>"
         if issubclass(self.tp, tuple):
@@ -579,7 +860,7 @@ class SequenceVariable(VariableInfo):
             common: TorchType = _common_torch_type(*torch_types)
             return torch.ListType(common)
         elif issubclass(self.tp, tuple):
-            return torch.TupleType(torch_types)
+            return torch.TupleType(torch_types) # pyright: ignore
         else:
             raise RuntimeError("Unknown sequence torch type")
 
@@ -603,16 +884,26 @@ class SequenceVariable(VariableInfo):
         assert self.seq_els is not None
         return self.seq_els[i]
 
-    def __iter__(self) -> Iterator:
-        assert self.seq_els is not None
+    def __iter__(self) -> Iterator[VariableInfo]:
+        assert self.sequence_length_is_const()
         return iter(self.seq_els)
 
-    def __next__(self, iter: Iterator) -> Optional[Iterator]:
-        raise NotImplementedError("TODO")
+    def __len__(self) -> int:
+        return self.sequence_const_length()
 
-    def __getitem__(self, item: int) -> VariableInfo:
+    @overload
+    def __getitem__(self, item: int) -> VariableInfo: ...
+
+    @overload
+    def __getitem__(self, item: slice) -> Sequence[VariableInfo]: ...
+
+    def __getitem__(self, item) -> VariableInfo|Sequence[VariableInfo]:
         assert self.seq_els is not None
         return self.seq_els[item]
+
+    def sequence_chunks(self) -> Iterator[VariableInfo]:
+        assert self.seq_els is not None
+        return iter(self.seq_els)
 
     def duplicate(self) -> VariableInfo:
         new_seq_els = list([e.duplicate() for e in self.seq_els])
@@ -668,55 +959,143 @@ class SequenceVariable(VariableInfo):
 
         return vars.inhomogeneous_sequence(name=name, origin=Origin.SAMPLE, tp=tuple, produced_by=produced_by, produced=produced, values=el_info)
 
+    def observe(self, observed: List[Any]) -> VariableInfo:
+        if self.sequence_length_is_const():
+            l = self.sequence_const_length()
+            obs = [[] for _ in range(l)]
+            for o in observed:
+                lo = len(o)
+                if lo != l:
+                    raise RuntimeError(f"observed sequence {o} of length {lo} incompatible with sequence {self} of length {l}")
+                for i in range(l):
+                    obs[i].append(o[i])
 
-class TensorShapeVariable(VariableInfo):
-    dims: List[VariableInfo]
+            for i in range(l):
+                self.seq_els[i] = self.seq_els[i].observe(obs[i])
+        else:
+            raise NotImplementedError()
+        
+        return self
+
+class TupleVariable(SequenceVariable):
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 tuple_els: List[VariableInfo]):
+        for el in tuple_els:
+            if el.is_sequence_chunk():
+                raise RuntimeError("Tuples should not have sequence chunks")
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, tp=tuple, seq_els=tuple_els)
+
+    def duplicate(self) -> 'TupleVariable':
+        return TupleVariable(name=self.name, owner=self.owner, origin=self.origin, produced_by=self.produced_by, produced=self.produced, tuple_els=[el.duplicate() for el in self.seq_els])
+
+class ConstantTuple(TupleVariable):
+    value: tuple
 
     def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: tuple):
+        self.value = value
+        tuple_els = [owner.constant(name=name+".#el"+str(i), origin=origin, value=value[i], produced_by=produced_by, produced=produced) for i in range(len(value))]
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, tuple_els=tuple_els)
+
+    def is_const(self) -> bool: return True
+    def const_value(self) -> tuple: return self.value
+    def duplicate(self) -> 'ConstantTuple': return type(self)(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
+
+
+class ListVariable(SequenceVariable):
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 tuple_els: List[VariableInfo]):
+        for el in tuple_els:
+            if el.is_sequence_chunk():
+                raise RuntimeError("Tuples should not have sequence chunks")
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, tp=tuple, seq_els=tuple_els)
+
+    def duplicate(self) -> 'ListVariable':
+        return type(self)(name=self.name, owner=self.owner, origin=self.origin, produced_by=self.produced_by, produced=self.produced, tuple_els=[el.duplicate() for el in self.seq_els])
+
+class ConstantList(ListVariable):
+    value: list
+
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: list):
+        self.value = value
+        tuple_els = [owner.constant(name=name+".#el"+str(i), origin=origin, value=value[i], produced_by=produced_by, produced=produced) for i in range(len(value))]
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, tuple_els=tuple_els)
+
+    def is_const(self) -> bool: return True
+    def const_value(self) -> list: return self.value
+    def duplicate(self) -> 'ConstantList': return type(self)(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
+
+
+class TensorShapeVariable(SequenceVariable):
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
                  dims: List[VariableInfo]):
-        super().__init__(name, owner, origin, produced_by,produced)
-        self.dims = dims
-        for d in dims:
-            assert isinstance(d, VariableInfo)
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by,produced=produced,tp=torch.Size,seq_els=dims)
 
     def __repr__(self) -> str:
         return f"{self.name}: {self.print_value()}"
 
-    def __iter__(self) -> Iterator: return iter(self.dims)
-    def __next__(self, iter: Iterator) -> Optional[Iterator]: return next(iter)
-    def __len__(self) -> int: return len(self.dims)
-    def __getitem__(self, item: int) -> VariableInfo: return self.dims[item]
+    def sequence_element_at_index(self, i: int) -> IntVariable:
+        result = super().sequence_element_at_index(i)
+        assert isinstance(result, IntVariable)
+        return result
 
-    def print_value(self) -> str:
-        return f"[{','.join([x.print_value() for x in self.dims])}]"
+    def __iter__(self) -> Iterator[IntVariable]:
+        return super().__iter__() # pyright: ignore
 
-    def is_const(self) -> bool:
-        for d in self.dims:
-            if not d.is_const():
-                return False
-        return True
+    @overload
+    def __getitem__(self, item: int) -> IntVariable: ...
 
-    def const_type(self) -> type: return list
-    def torch_type(self) -> TorchType: return torch.ListType(torch.IntType.get())
+    @overload
+    def __getitem__(self, item: slice) -> Sequence[IntVariable]: ...
 
-    def const_value(self) -> Any:
-        return list([d.const_value() for d in self.dims])
+    def __getitem__(self, item: int|slice) -> IntVariable|Sequence[IntVariable]:
+        result = super().__getitem__(item)
+        if isinstance(item, int):
+            if not isinstance(result, IntVariable):
+                raise RuntimeError(f"TensorShape item {item} is not integer: {result}")
+            return result
+        elif isinstance(item, slice):
+            # TODO check
+            return result  # pyright: ignore
+        else:
+            raise NotImplementedError()
 
-    def is_sequence(self) -> bool:
-        return True
+    #def __iter__(self) -> Iterator: return iter(self.dims)
+    #def __next__(self, iter: Iterator) -> Optional[Iterator]: return next(iter)
+    #def __len__(self) -> int: return len(self.dims)
+    #def __getitem__(self, item: int) -> VariableInfo: return self.dims[item]
 
-    def sequence_length(self) -> 'VariableInfo': return self.seq_length
+    #def print_value(self) -> str:
+    #    return f"[{','.join([x.print_value() for x in self.dims])}]"
 
-    def sequence_length_is_const(self) -> bool:
-        return True
+    #def is_const(self) -> bool:
+    #    for d in self.dims:
+    #        if not d.is_const():
+    #            return False
+    #    return True
 
-    def sequence_const_length(self) -> int:
-        return len(self.dims)
+    #def const_type(self) -> type: return list
+    #def torch_type(self) -> TorchType: return torch.ListType(torch.IntType.get())
 
-    def sequence_element_at_index(self, i: int) -> VariableInfo:
-        return self.dims[i]
+    #def const_value(self) -> Any:
+    #    return list([d.const_value() for d in self.dims])
 
-    def duplicate(self) -> VariableInfo: return TensorShapeVariable(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,dims=list([d.duplicate() for d in self.dims]))
+    #def is_sequence(self) -> bool:
+    #    return True
+
+    #def sequence_length(self) -> 'VariableInfo': return self.owner.constant(name=self.name+".#length", origin=self.origin, produced_by=self.produced_by, produced=self.produced, value=len(self.dims))
+
+    #def sequence_length_is_const(self) -> bool:
+    #    return True
+
+    #def sequence_const_length(self) -> int:
+    #    return len(self.dims)
+
+    #def sequence_element_at_index(self, i: int) -> VariableInfo:
+    #    return self.dims[i]
+
+    def duplicate(self) -> VariableInfo: return TensorShapeVariable(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,dims=self.seq_els)
 
     @staticmethod
     def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'VariableInfo':
@@ -747,100 +1126,192 @@ class TensorShapeVariable(VariableInfo):
 
         return TensorShapeVariable(name=name, owner=vars, origin=Origin.SAMPLE, produced_by=produced_by, produced=produced, dims=dims)
 
-class ScalarVariable(VariableInfo):
-    # Anything which is a scalar value with a known type
+    def observe(self, observed: List[Any]) -> 'TensorShapeVariable':
+        observed_dims: List[List[int]] = [[] for _ in self.seq_els]
+        for o in observed:
+            assert len(o) == len(self.seq_els)
+            for x,y in zip(o, observed_dims):
+                assert isinstance(x, int)
+                y.append(x)
 
-    type: Type
+        for i in range(len(self.seq_els)):
+            self.seq_els[i] = self.seq_els[i].observe(observed_dims[i])
 
-    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
-                 type: Type):
-        assert not issubclass(type, torch.Tensor)
-        super().__init__(name, owner, origin, produced_by,produced)
-        self.type = type
-
-    def __repr__(self) -> str: return f"{self.name}:  {self.type.__name__}"
-    def print_value(self) -> str: return f"<{self.name}: {self.type.__name__}>"
-    def is_const(self) -> bool: return False
-    def const_type(self) -> Type: return self.type
-    def torch_type(self) -> TorchType: return _scalar_torch_type(self.type)
-    def is_tensor(self) -> bool: return False
-    def duplicate(self) -> VariableInfo: return ScalarVariable(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,type=self.type)
-
-    def combine(self, other: 'VariableInfo') -> 'VariableInfo':
-        type1 = self.const_type()
-        type2 = other.const_type()
-        if type1 != type2:
-            raise NotImplementedError(f"combine ScalarVariables of differing types {type1} {type2}")
-        return self.duplicate()
+        return self
 
     @staticmethod
-    def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'VariableInfo':
+    def covering(vars: 'Variables', name: str, produced_by: Optional[Node|Graph], produced: int, infos: Sequence['VariableInfo']) -> 'VariableInfo':
+        length_counts: Dict[int, int] = {}
 
-        type_samples: Dict[type, List[Any]] = {}
-        for v in samples:
-            t = type(v)
-            if t in type_samples:
-                type_samples[t].append(v)
+        for v in infos:
+            assert isinstance(v, TensorShapeVariable)
+            l = len(v)
+            if l in length_counts:
+                length_counts[l] += 1
             else:
-                type_samples[t] = [v]
+                length_counts[l] = 1
 
-        if len(type_samples) > 1:
-            print("type_samples", type_samples)
-            raise NotImplementedError("multiple types")
+        if len(length_counts) > 1:
+            raise NotImplementedError("multiple lengths")
 
-        for t,s in type_samples.items():
-            if t == int:
-                return IntVariable.sampled(name, torch_type, s, produced_by, produced, vars)
-            raise NotImplementedError("scalar of type", t)
+        l,_ = length_counts.popitem()
 
-        raise NotImplementedError()
+        subsamples: List[List[IntVariable]] = [[] for _ in range(l)]
 
-class IntVariable(ScalarVariable):
+        for s in infos:
+            assert isinstance(s, TensorShapeVariable)
+            for i,ls in enumerate(s):
+                subsamples[i].append(ls)
 
-    min_value: Optional[int] = None
-    max_value: Optional[int] = None
+        dims = [vars.covering(name=name+".#dim"+str(i), options=ss, produced_by=produced_by, produced=produced) for i,ss in enumerate(subsamples)]
+
+        return TensorShapeVariable(name=name, owner=vars, origin=Origin.SAMPLE, produced_by=produced_by, produced=produced, dims=dims)
+
+class ConstantShape(TensorShapeVariable):
+    value: torch.Size
 
     def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
-                 min_value: Optional[int] = None, max_value: Optional[int] = None):
-        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, type=int)
-        self.min_value = min_value
-        self.max_value = max_value
+                 value: torch.Size):
+        self.value = value
+        dims = [owner.constant(name=name+".#el"+str(i), origin=origin, value=value[i], produced_by=produced_by, produced=produced) for i in range(len(value))]
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, dims=dims)
 
-    def __repr__(self) -> str: return f"{self.name}:  {self.print_value()}"
-    def print_value(self) -> str:
-        result = "int"
-        if self.min_value is not None or self.max_value is not None:
-            result += "{"
-            if self.min_value is not None:
-                result += str(self.min_value)
-            result += ":"
-            if self.max_value is not None:
-                result += str(self.max_value)
-            result += "}"
-        return result
+    def is_const(self) -> bool: return True
+    def const_value(self) -> torch.Size: return self.value
+    def duplicate(self) -> VariableInfo: return type(self)(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
+
+class TensorVariable(VariableInfo):
+    # The following are for Tensors.  We model the data type, device and shape separately.
+    dtype: DataTypeVariable
+    device: DeviceVariable
+    shape: TensorShapeVariable
+
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 dtype: DataTypeVariable, device: DeviceVariable, shape: TensorShapeVariable):
+        super().__init__(name, owner, origin, produced_by,produced)
+        assert issubclass(dtype.const_type(), torch.dtype)
+        assert issubclass(device.const_type(), torch.device)
+        #print("shape", shape)
+        assert shape.is_sequence()
+        self.dtype = dtype
+        self.device = device
+        self.shape = shape
+
+    def __repr__(self) -> str:
+        return f"{self.name}: tensor {_print_tensor_info(self)}"
+
+    def print_value(self) -> str: return _print_tensor_info(self)
+    def const_type(self) -> type: return torch.Tensor
+    def torch_type(self) -> TorchType: return torch.TensorType.get()
+    def is_const(self) -> bool: return False
+    def is_tensor(self) -> bool: return True
+    def tensor_dtype(self) -> VariableInfo: return self.dtype
+    def tensor_device(self) -> VariableInfo: return self.device
+    def tensor_const_dtype(self) -> Optional[torch.dtype]:
+        if self.dtype.is_const():
+            return self.dtype.const_value()
+        return None
+    def tensor_const_device(self) -> Optional[torch.device]:
+        if self.device.is_const():
+            return self.device.const_value()
+        return None
+    def tensor_shape(self) -> VariableInfo: return self.shape
+
+    def duplicate(self) -> VariableInfo:
+        return TensorVariable(name=self.name, owner=self.owner, origin=self.origin, produced_by=self.produced_by,
+                                produced=self.produced, dtype=self.dtype.duplicate(), device=self.device.duplicate(), shape=self.shape.duplicate())
 
     @staticmethod
-    def sampled(name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> VariableInfo:
-        min_value = min(samples)
-        max_value = max(samples)
-        assert isinstance(torch_type, torch.IntType)
-        return IntVariable(name=name, owner=vars, origin=Origin.SAMPLE, produced_by=produced_by, produced=produced, min_value=min_value, max_value=max_value)
+    def sampled(name: str, tp: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> 'VariableInfo':
+
+        val_counts: Dict[Any, int] = {}
+        for v in samples:
+            if v in val_counts:
+                val_counts[v] += 1
+            else:
+                val_counts[v] = 1
+
+        tensor_dtypes: List[torch.dtype] = []
+        tensor_devices: List[torch.device] = []
+        tensor_shapes: List[List[int]] = []
+
+        for s in samples:
+            assert isinstance(s, torch.Tensor)
+            tensor_dtypes.append(s.dtype)
+            tensor_devices.append(s.device)
+            tensor_shapes.append(list(s.shape))
+
+        dtype = vars.sampled(name=name+".#dtype", torch_type=torch.IntType.get(), samples=tensor_dtypes, produced_by=produced_by, produced=produced)
+        device = vars.sampled(name=name+".#device", torch_type=torch.DeviceObjType.get(), samples=tensor_devices, produced_by=produced_by, produced=produced)
+        shape = TensorShapeVariable.sampled(name=name+".#shape", torch_type=torch.ListType(torch.IntType.get()), samples=tensor_shapes, produced_by=produced_by, produced=produced, vars=vars)
+
+        return vars.tensor(name=name, origin=Origin.SAMPLE, dtype=dtype, device=device, shape=shape, produced_by=produced_by, produced=produced)
+
+    def observe(self, observed: List[Any]) -> VariableInfo:
+        devices,dtypes,shapes = [],[],[]
+
+        for o in observed:
+            assert isinstance(o, torch.Tensor)
+            devices.append(o.device)
+            dtypes.append(o.dtype)
+            shapes.append(o.shape)
+
+        self.device = self.device.observe(devices)
+        self.dtype = self.dtype.observe(dtypes)
+        self.shape = self.shape.observe(shapes)
+
+        return self
+
+    @staticmethod
+    def covering(vars: 'Variables', name: str, produced_by: Optional[Node|Graph], produced: int, infos: Sequence['VariableInfo']) -> 'VariableInfo':
+        devices,dtypes,shapes = [],[],[]
+
+        for i in infos:
+            i = i.as_tensor()
+            devices.append(i.tensor_device())
+            dtypes.append(i.tensor_dtype())
+            shapes.append(i.tensor_shape())
+
+        device = vars.covering(devices, name+".#device", produced_by, produced)
+        dtype = vars.covering(dtypes, name+".#dtype", produced_by, produced)
+        shape = vars.covering(shapes, name+".#shape", produced_by, produced)
+
+        return vars.tensor(name=name, origin=Origin.CONST_PROP, dtype=dtype, device=device, shape=shape, produced_by=produced_by, produced=produced)
+
+class ConstantTensor(TensorVariable):
+
+    value: torch.Tensor
+
+    def __init__(self, *, name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int,
+                 value: torch.Tensor):
+        dtype=owner.constant(name=name+".#dtype", origin=origin, value=value.dtype, produced_by=produced_by, produced=produced).as_data_type()
+        device=owner.constant(name=name+".#device", origin=origin, value=value.device, produced_by=produced_by, produced=produced).as_device()
+        shape=owner.constant(name=name+".#shape", origin=origin, value=value.shape, produced_by=produced_by, produced=produced).as_shape()
+        super().__init__(name=name, owner=owner, origin=origin, produced_by=produced_by, produced=produced, dtype=dtype, device=device, shape=shape)
+        self.value = value
+
+    def is_const(self) -> bool: return True
+    def const_value(self) -> Any: return self.value
+    def duplicate(self) -> VariableInfo: return type(self)(name=self.name,owner=self.owner,origin=self.origin,produced_by=self.produced_by,produced=self.produced,value=self.value)
 
 class OptionalVariable(VariableInfo):
     # Variable or None
 
     some: VariableInfo
 
-    def __init__(self, some: VariableInfo):
-        super().__init__(some.name, some.owner, some.origin, some.produced_by, some.produced)
+    def __init__(self, name: str, some: VariableInfo):
+        super().__init__(name, some.owner, some.origin, some.produced_by, some.produced)
         self.some = some
 
     def __repr__(self) -> str: return f"{self.name}:  optional {self.print_value()}"
     def print_value(self) -> str: return self.some.print_value() + "?"
     def is_const(self) -> bool: return False
+    def is_optional(self) -> bool: return True
     def const_type(self) -> Type: return object
+    def torch_type(self) -> TorchType: return torch.OptionalType(self.some.torch_type())
     def is_tensor(self) -> bool: return False
-    def duplicate(self) -> VariableInfo: return OptionalVariable(some=self.some.duplicate())
+    def duplicate(self) -> VariableInfo: return OptionalVariable(name=self.name, some=self.some.duplicate())
+    def non_optional(self) -> VariableInfo: return self.some
 
     @staticmethod
     def sampled(name: str, tp: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int, vars: 'Variables') -> VariableInfo:
@@ -862,17 +1333,32 @@ class OptionalVariable(VariableInfo):
         contained = vars.sampled(name + ".#some", contained_type, no_nones, produced_by=produced_by, produced=produced)
 
         if len(no_nones) == len(samples):
-            return contained
+            return contained.renamed(name)
 
-        result = OptionalVariable(contained)
+        result = OptionalVariable(name, contained)
         return result
 
+    def observe(self, observed: List[Any]) -> VariableInfo:
+        some_observed = []
+        for o in observed:
+            if o is None:
+                continue
+            some_observed.append(o)
 
-def _print_var_fields(name: str, origin: Any, const: Any, produced: Any, first_consumed: Any, last_consumed: Any, produced_by: Any, tp: Any, const_value: Any) -> str:
-    return f"{name:20} {origin:10} {const:6} {produced:5} {first_consumed:5} {last_consumed:5} {produced_by:15} {tp:12} {const_value}"
+        self.some = self.some.observe(some_observed)
+
+        return self
+
+def _print_var_fields(name: str, origin: Any, const: Any,
+                      produced: Any, first_consumed: Any, last_consumed: Any,
+                      produced_by: Any, tp: Any, const_value: Any) -> str:
+    return f"{name:20} {origin:10} {const:6} {produced_by:15} {tp:12} {const_value}"
+    #return f"{name:20} {origin:10} {const:6} {produced:5} {first_consumed:5} {last_consumed:5} {produced_by:15} {tp:12} {const_value}"
 
 def _print_var_names() -> str:
-    return _print_var_fields("name", "origin", "const", "prod", "first", "last", "node", "type", "value")
+    return _print_var_fields("name", "origin", "const",
+                             "prod", "first", "last",
+                             "node", "type", "value")
 
 def _print_tensor_info(info: VariableInfo) -> str:
     """
@@ -907,7 +1393,11 @@ def _short_info_str(info: VariableInfo) -> str:
             el_strs: List[str] = []
             l = info.sequence_const_length()
             for i in range(l):
-                el_strs.append(_short_info_str(info.sequence_element_at_index(i)))
+                el = info.sequence_element_at_index(i)
+                if el.is_const():
+                    el_strs.append(_short_info_str(el))
+                else:
+                    el_strs.append(el.name + "=" + el.print_value())
             value_str = open + ", ".join(el_strs) + close
         elif info.seq_length is not None:
             assert info.seq_el is not None
@@ -943,6 +1433,10 @@ def _print_var(name: str, info: VariableInfo) -> str:
     value_str: str = ""
     if info.is_const():
         value_str = _print_value(info.const_value())
+    elif info.is_optional():
+        nonopt = info.non_optional()
+        type_str = nonopt.const_type().__name__ + "?"
+        value_str = nonopt.print_value() + "?"
     elif info.const_type() == torch.Tensor:
         value_str = _print_tensor_info(info)
     elif info.const_type() == list or info.const_type() == tuple:
@@ -975,50 +1469,80 @@ def _print_var(name: str, info: VariableInfo) -> str:
     return _print_var_fields(name, info.origin.name, info.is_const(), info.produced, info.first_consumed,
                              info.last_consumed, produced_kind, type_str, value_str)
 
-@dataclass
+class Expression(VariableInfo):
+    """
+    Represents the result of evaluating an expression
+    """
+
+    def __init__(self, op: str, args: List[VariableInfo], name: str, owner: 'Variables', origin: Origin, produced_by: Optional[Node|Graph], produced: int):
+        super().__init__(name, owner, origin, produced_by, produced)
+        arity = len(args)
+
+
+
 class Variables:
-    vars: OrderedDict[str, VariableInfo] = field(default_factory=OrderedDict)
+    _vars: OrderedDict[str, VariableInfo]
+    _outer: Optional['Variables']
+
+    def __init__(self, outer: Optional['Variables'] = None):
+        super().__init__()
+        self._vars = OrderedDict()
+        self._outer = outer
 
     def __len__(self) -> int:
-        return len(self.vars)
+        return len(self._vars)
+
+    def __getitem__(self, item: str) -> VariableInfo:
+        return self._vars[item]
+
+    def items(self) -> Iterable[Tuple[str, VariableInfo]]:
+        return self._vars.items()
+
+    def keys(self) -> Iterable[str]:
+        return self._vars.keys()
+
+    def values(self) -> Iterable[VariableInfo]:
+        return self._vars.values()
 
     def add(self, v: VariableInfo):
         assert v.produced_by is None or isinstance(v.produced_by, Node) or isinstance(v.produced_by, Graph)
         assert len(v.name) > 0
-        assert v.name not in self.vars
-        self.vars[v.name] = v
-
-    def add_constant(self, n: str, v: Any, node: Node, i: int):
-        assert isinstance(node, Node)
-        info = VariableInfo(n, Origin.CONST_PROP, True, v, node, i)
-        self.add(info)
+        if v.name in self._vars:
+            raise RuntimeError(f"Attempt to double-add variable {v.name} {v}")
+        assert v.name not in self._vars
+        self._vars[v.name] = v
 
     def get(self, n: str, i: int) -> VariableInfo:
-        result = self.vars[n]
-        if i < result.first_consumed:
-            result.first_consumed = i
-        if i > result.last_consumed:
-            result.last_consumed = i
-        return result
+        if n in self._vars:
+            result = self._vars[n]
+            if i < result.first_consumed:
+                result.first_consumed = i
+            if i > result.last_consumed:
+                result.last_consumed = i
+            return result
+        elif self._outer is not None:
+            return self._outer.get(n, i)
+        else:
+            raise KeyError(n)
 
     def renamed(self, var: VariableInfo, new_name: str) -> VariableInfo:
         new_var = var.renamed(new_name)
         new_var.owner = self
-        self.add(new_var)
+        #self.add(new_var)
         return new_var
 
     def unify(self, value: Any, *vars: VariableInfo):
         """
-        Say that all of the given variables have the given value.
+        Say that all of the given variables have the given value.  Returns a variable that represents the value.
         """
         print("TODO: unify")
 
-    def alias(self, *vars: VariableInfo):
+    def alias(self, *vars: VariableInfo) -> 'VariableInfo':
         """
         Say that all of the given variables have the same value (each is an alias of the other one).
         """
         if len(vars) < 2:
-            return
+            return vars[0]
 
         known_values = []
         for v in vars:
@@ -1032,7 +1556,7 @@ class Variables:
                     raise RuntimeError(f"Error: attempt to unify differing values: {val} and {known_values[0]}")
 
         if len(known_values) == 0:
-            return
+            return vars[0]
 
         for v in vars:
             if not v.is_const():
@@ -1040,126 +1564,17 @@ class Variables:
                 # TODO Record the alias
                 pass
 
+        return vars[0]
 
     def new_frame(self) -> 'Variables':
-        result = Variables()
-        for s,i in self.vars.items():
-            i2 = i.duplicate()
-            i2.owner = self
-            result.add(i2)
-        return result
+        return Variables(outer=self)
 
     def dump_vars(self, indent: str = '', start_at: int = 0):
         print(f"{indent} {fg.boldblack}{_print_var_names()}{reset}")
-        for i,(name,info) in enumerate(self.vars.items()):
+        for i,(name,info) in enumerate(self._vars.items()):
             if i < start_at:
                 continue
             print(indent, _print_var(name, info))
-
-    def argument(self, *, name: str, produced_by: Optional[Node|Graph], observed: 'ArgumentData', torch_type: TorchType) -> VariableInfo:
-        """
-        Return the variable info for an argument.  This will specialize based on the observed
-        values.
-        """
-
-        summary = observed.summarize()
-
-        if summary.is_const():
-            val = summary.const_value()
-            return ConstantVariable(name=name, owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1, value=val)
-
-        wrap: Callable[[VariableInfo], VariableInfo] = lambda x: x
-
-        is_optional = summary.is_optional()
-        if is_optional:
-            summary = summary.non_optional()
-            wrap = lambda x: OptionalVariable(x)
-
-        dtype: Optional[torch.dtype] = summary.get_dtype()
-        device: Optional[torch.device] = summary.get_device()
-        shape: Optional[TensorShapes] = summary.get_shape()
-        tp: Optional[Type] = summary.get_type()
-        ttp: Optional[TorchType] = summary.get_torch_type()
-
-        tp,ttp,dtype,device,shape = _unify_types(summary, torch_type)
-
-        def constant_or_scalar(name: str, value: Optional[Tp], type: Type[Tp]) -> VariableInfo:
-            if value is not None:
-                assert isinstance(value, type)
-                return ConstantVariable(name=name, owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1,
-                                           value=value)
-            else:
-                return ScalarVariable(name=name, owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1,
-                                         type=type)
-
-        assert tp is not None
-        if issubclass(tp, torch.Tensor):
-            dtypevi = constant_or_scalar(name+"#.dtype", dtype, torch.dtype)
-            devicevi = constant_or_scalar(name+".#device", device, torch.device)
-            assert shape is not None
-
-            def shape_to_var(name: str, shape: TensorShape) -> List[VariableInfo]:
-
-                def dim_to_var(name: str, dim: ShapeRange) -> VariableInfo:
-                    if dim.is_const():
-                        return ConstantVariable(name=name, owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1, value=dim.const_value())
-                    else:
-                        return ScalarVariable(name=name, owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1,
-                                         type=int)
-
-                dims: List[VariableInfo] = []
-
-                for i,dim in enumerate(shape.dims):
-                    dims.append(dim_to_var(name + f"[{i}]", dim))
-
-                return dims
-
-
-            
-
-            dims = shape_to_var(name+".#shape", shape.unique_length())
-
-            shapevi = TensorShapeVariable(name=name+".#shape", owner=self,origin=Origin.ARG, produced_by=produced_by, produced=-1,
-                                          dims=dims)
-
-
-            if dtype is not None:
-                dtypevi = ConstantVariable(name=name+".#dtype", owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1,
-                                           value=dtype)
-            else:
-                dtypevi = ScalarVariable(name=name+".#dtype", owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1,
-                                         type=torch.dtype)
-
-            return wrap(TensorVariable(name=name, owner=self, origin=Origin.ARG,
-                                  produced_by=produced_by, produced=-1, dtype=dtypevi, device=devicevi,shape=shapevi))
-        elif issubclass(tp, tuple) or issubclass(tp, list):
-            if isinstance(ttp, torch.TupleType):
-                els = ttp.elements()
-                nels = len(els)
-                assert len(observed.tuple_args) == nels
-                el_args: List[VariableInfo] = []
-
-                for i,el in enumerate(els):
-                    el_observed = observed.tuple_args[i]
-                    el_arg = self.argument(name=name+".#el" + str(i), produced_by=produced_by, observed=el_observed, torch_type=el)
-                    el_args.append(el_arg)
-
-                nels = self.constant(name=name+".#length", origin=Origin.ARG, value=nels, produced_by=produced_by,produced=-1)
-
-                return wrap(SequenceVariable(name=name, owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1,
-                            tp=tp, seq_length=nels, seq_els=el_args, seq_el=None))
-            else:
-                raise NotImplementedError("TODO: list args")
-
-            return wrap(SequenceVariable(name=name, owner=self, origin=Origin.ARG, produced_by=produced_by, produced=-1))
-            raise NotImplementedError("TODO: implement list or tuple arguments")
-        else:
-            raise NotImplementedError(f"TODO: implement other types of arguments {ttp} {tp}")
-
-        result = ArgumentVariable(name=name, owner=self, origin=Origin.ARG,
-                              produced_by=produced_by, produced=-1, arg=summary)
-
-        return result
 
     def sampled(self, name: str, torch_type: TorchType, samples: List[Any], produced_by: Optional[Node|Graph], produced: int) -> VariableInfo:
         """
@@ -1189,13 +1604,74 @@ class Variables:
             return SequenceVariable.sampled(name, torch_type, samples, produced_by, produced, self)
             contained = torch_type.containedTypes()
         elif isinstance(torch_type, torch.IntType):
-            return ScalarVariable.sampled(name, torch_type, samples, produced_by, produced, self)
+            return IntVariable.sampled(name, torch_type, samples, produced_by, produced, self)
             print("scalar type", torch_type.scalarType())
             raise NotImplementedError()
         else:
             raise RuntimeError(f"Unknown torch_type {torch_type}")
 
         raise NotImplementedError()
+
+    def scalar(self, *, name: str, origin: Origin, tp: Type, produced_by: Optional[Node|Graph], produced: int) -> VariableInfo:
+        """
+        Return a scalar variable, specialized for the given type
+        """
+        if tp == int:
+            return IntVariable(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced)
+        elif tp == float:
+            return FloatVariable(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced)
+        elif tp == str:
+            return StringVariable(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced)
+        elif tp == bool:
+            return BooleanVariable(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced)
+        elif tp == torch.dtype:
+            return DataTypeVariable(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced)
+        elif tp == torch.device:
+            return DeviceVariable(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced)
+        else:
+            raise RuntimeError("unknown scalar type")
+
+    def expression(self, op: str, args: List[Any], name: str, origin: Origin, produced_by: Optional[Node|Graph], produced: int) -> VariableInfo:
+        # Wrap each arg in a VariableInfo
+
+        all_const = True
+        values = []
+        def wrap_arg(i: int, arg: Any) -> VariableInfo:
+            if isinstance(arg, VariableInfo):
+                if not arg.is_const():
+                    all_const = False
+                else:
+                    values.append(arg.const_value())
+                return arg
+            else:
+                values.append(arg)
+                return self.constant(name=name+"#arg"+str(i), origin=Origin.EXPRESSION, value=arg, produced_by=None, produced=-1)
+            
+        wrapped_args = [wrap_arg(i, arg) for i,arg in enumerate(args)]
+
+        graph = Graph()
+
+        inputs = []
+
+        for arg in wrapped_args:
+            input = graph.addInput(arg.name)
+            input.setType(arg.torch_type())
+            inputs.append(input)
+
+        print("inputs", inputs)
+
+        node = graph.create(op, inputs, 1)
+
+        print("node", node)
+
+        operator = get_torch_operator(node)
+
+        print("operator", operator)
+        print("values", values)
+
+        operator.const_prop()
+
+        return Expression(op=op, args=args, name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced)
 
     def local(self, *, name: str, origin: Origin, tp: Type, produced_by: Optional[Node|Graph], produced: int) -> VariableInfo:
         """
@@ -1204,7 +1680,7 @@ class Variables:
         """
         assert not issubclass(tp, torch.Tensor), "Tensors should use the tensor method, not local"
 
-        return ScalarVariable(name=name, owner=self, type=tp, origin=origin,
+        return self.scalar(name=name, tp=tp, origin=origin,
                             produced_by=produced_by, produced=produced)
 
     def tensor(self, *, name: str, origin: Origin,
@@ -1221,6 +1697,9 @@ class Variables:
         """
         Return the variable info for a tensor shape variable.
         """
+        for d in dims:
+            if not isinstance(d, IntVariable):
+                raise RuntimeError(f"tensor_shape was not an integer: {d}")
         all_const = all(map(lambda x: x.is_const(), dims))
         if all_const:
             for x in dims:
@@ -1267,5 +1746,196 @@ class Variables:
         information.
         """
 
-        return ConstantVariable(name=name, owner=self, origin=origin, value=value,
-                            produced_by=produced_by, produced=produced)
+        if value is None:
+            return NoneVariable(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced)
+        elif isinstance(value, int):
+            return ConstantInt(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, float):
+            return ConstantFloat(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, str):
+            return ConstantString(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, bool):
+            return ConstantBool(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, torch.Size):
+            return ConstantShape(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, tuple):
+            return ConstantTuple(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, list):
+            return ConstantList(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, torch.dtype):
+            return ConstantDataType(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, torch.device):
+            return ConstantDevice(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        elif isinstance(value, torch.Tensor):
+            return ConstantTensor(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+        else:
+            return ConstantValue(name=name, owner=self, origin=origin, produced_by=produced_by, produced=produced, value=value)
+            raise RuntimeError(f"Cannot create constant of type {type(value).__name__} {_print_value(value)}")
+
+    def covering(self, options: Sequence[VariableInfo], name: str, produced_by: Optional[Node|Graph], produced: int) -> 'VariableInfo':
+        ancestors = set(type(options[0]).mro())
+        for i in range(1,len(options)):
+            option = options[i]
+            myancestors = set(type(option).mro())
+            ancestors.intersection_update(myancestors)
+
+        result: Type[VariableInfo] = VariableInfo
+        for tp in type(options[0]).mro():
+            if tp in ancestors:
+                result = tp
+                break
+
+        assert issubclass(result, VariableInfo)
+
+        print("using class", result, "for covering")
+
+        all_const = True
+        const_values = []
+        for o in options:
+            if o.is_const():
+                const_values.append(o.const_value())
+            else:
+                all_const = False
+        
+        if all_const:
+            # Can use the sampled method, which will complete constant propagation
+            torch_type = _to_torch_type(None, const_values)
+
+            unique_values = set()
+            for v in const_values:
+                unique_values.add(v)
+            
+            if len(unique_values) == 1:
+                # It's a constant
+                return self.constant(name=name, origin=Origin.CONST_PROP, value=unique_values.pop(), produced_by=produced_by, produced=produced)
+
+            return result.sampled(name, torch_type, const_values, produced_by, produced, self)
+        
+        return result.covering(self, name, produced_by, produced, options)
+
+    def add_covering(self, options: Sequence[VariableInfo], name: str, produced_by: Optional[Node|Graph], produced: int) -> VariableInfo:
+        """Add a variable of the given name, who could be a value given by any of the options"""
+        if len(options) == 1:
+            result = options[0].renamed(name)
+        else:
+            result = self.covering(options, name, produced_by, produced)
+
+        result.owner = self
+        self.add(result)
+        return result
+
+    def add_optional(self, options: Sequence[VariableInfo], name: str, produced_by: Optional[Node|Graph], produced: int) -> VariableInfo:
+        """Add a variable of the given name, whose value may be present and, if so, is given by any of the options"""
+        if len(options) == 1:
+            option = options[0]
+            if option.is_optional():
+                result = option.renamed(name)
+            else:
+                result = OptionalVariable(name=name, some=option)
+            result.owner = self
+            self.add(result)
+            return result
+        else:
+            print("name", name, "options", options)
+            raise NotImplementedError()
+
+@dataclass
+class Invocation:
+    args: Tuple
+    kwargs: OrderedDict[str, Any] = field(default_factory = OrderedDict)
+    output: Tuple = field(default_factory = tuple)
+    elapsed: float = 0
+
+    def __str__(self) -> str:
+        def summarize_arg(arg: Any) -> str:
+            if isinstance(arg, dict):
+                return str(dict({k: summarize_arg(v) for k,v in arg.items()}))
+            elif isinstance(arg, tuple):
+                return str(tuple(summarize_arg(v) for v in arg))
+            elif isinstance(arg, list):
+                return str(list([summarize_arg(v) for v in arg]))
+            elif isinstance(arg, torch.Tensor):
+                if arg.numel() < 10:
+                    return str(arg)
+                else:
+                    return _print_param(arg.size(), arg.dtype, arg.device) + " " + str(arg.device)
+            else:
+                return str(arg)
+
+        summarized_args = list(map(summarize_arg, self.args))
+        summarized_kwargs = {k: summarize_arg(v) for k,v in self.kwargs.items()}
+
+        return f"Invocation(elapsed={print_elapsed(self.elapsed)} args={summarized_args} kwargs={summarized_kwargs})"
+
+@dataclass
+class SummaryData:
+    arg_lengths: Dict[int, int] = field(default_factory = dict)
+    args: List[VariableInfo] = field(default_factory = list)
+    kwargs: Dict[str, VariableInfo] = field(default_factory = dict)
+
+    def print_args(self, indent: int = 0):
+        ind = ' ' * indent
+        for i in range(len(self.args)):
+            arg = self.args[i]
+            print(f"{ind}{i}: {arg}")
+
+        for kw,arg in self.kwargs.items():
+            print(f"{ind}{kw}: {arg}")
+
+@dataclass
+class Invocations:
+    m: Module
+    path: str
+    sig: inspect.Signature
+    calls: List[Invocation] = field(default_factory = list)
+    children: Dict[str, 'Invocations'] = field(default_factory = dict)
+
+    def __init__(self, m: Module, path: str, *,
+                 sig: Optional[inspect.Signature] = None,
+                 calls: Optional[List[Invocation]] = None,
+                 children: Optional[Dict[str, 'Invocations']] = None):
+        self.m = m
+        self.path = path
+        self.sig = inspect.signature(m.forward) if sig is None else sig
+        self.calls = [] if calls is None else calls
+        self.children = {} if children is None else children
+
+    def total_runtime(self) -> float:
+        return sum([c.elapsed for c in self.calls])
+
+    def __str__(self) -> str:
+        return f"Invocations(path={self.path} module={self.m._get_name()} runtime={print_elapsed(self.total_runtime())} ncalls={len(self.calls)} nchildren={len(self.children)})" # sig={inspect.signature(self.m.forward)})"
+
+    def summarize(self) -> SummaryData:
+        vars = Variables()
+        result = SummaryData()
+
+        max_nargs = 0
+        all_kwargs: Set[str] = set()
+        for c in self.calls:
+            nargs = len(c.args)
+            result.arg_lengths[nargs] = result.arg_lengths.get(nargs, 0) + 1
+            max_nargs = max(max_nargs, nargs)
+            all_kwargs.update(c.kwargs.keys())
+
+        print("max_nargs", max_nargs)
+        print("parameters=", self.sig.parameters)
+        ordered_params: List[Tuple[str, inspect.Parameter]] = list(self.sig.parameters.items())
+
+        for i in range(max_nargs):
+            name,param = ordered_params[i]
+            print("param", name, param)
+            samples = [c.args[i] for c in self.calls if i < len(c.args[i])]
+
+            torch_type = _to_torch_type(param.annotation, samples)
+            result.args.append(vars.sampled(name=name, torch_type=torch_type, samples=samples, produced_by=None, produced=-1))
+            
+
+        for k in all_kwargs:
+            param = self.sig.parameters[k]
+            samples = [c.kwargs.get(k) for c in self.calls if k in c.kwargs]
+            torch_type = _to_torch_type(param.annotation, samples)
+            result.kwargs[k] = vars.sampled(name=k, torch_type=torch_type, samples=samples, produced_by=None, produced=-1)
+
+        return result
+

@@ -9,7 +9,6 @@ from torch.nn import Module
 from torch import Tensor, ScriptModule, ScriptFunction, Value, Size, Block, dtype, memory_format, device, scalar_tensor, add, tanh
 import torch.jit as jit
 import torch.fx as fx
-from torch.fx import symbolic_trace
 import torch
 import inspect
 import time
@@ -25,7 +24,7 @@ from dataclasses import dataclass, field
 
 
 from ansi.color import bg, fg
-from ansi.color.fx import reset
+from ansi.color.fx import reset # pyright: ignore
 
 def process_args(_, device_in='cpu', dtype_in='float32'):
     global device, dtype
@@ -107,6 +106,7 @@ prompt = (
     "previously unexplored valley, in the Andes Mountains. Even more surprising to the "
     "researchers was the fact that the unicorns spoke perfect English."
 )
+
 
 input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 

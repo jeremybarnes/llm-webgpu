@@ -1,18 +1,16 @@
 import torch
 import torch.jit as jit
-from torch.jit import RecursiveScriptModule, ScriptModule
+from torch.jit import RecursiveScriptModule, ScriptModule # pyright: ignore
 from torch.nn import Module
-from torch.fx import symbolic_trace
 from typing import Dict, List, Any, Tuple, Optional, Callable, Sequence, SupportsInt, Union, Iterator, get_origin, get_args, Set, overload
 import inspect
 from dataclasses import dataclass, field
 import time
 import copy
-from runtimes import print_elapsed
 from collections import defaultdict, OrderedDict
 from torch.utils.hooks import RemovableHandle
 from utils import _short_dtype, _print_value, _print_param, _print_value, typeify
-from variables import VariableInfo, Variables, _to_torch_type
+from variables import VariableInfo, Variables, _to_torch_type, Invocations, SummaryData, Invocation
 
 
 def introspect_model(m: Module):
@@ -66,125 +64,6 @@ def introspect_model(m: Module):
     print("module counts")
     for name,count in sorted(moduleCounts.items()):
         print(f"{name:>40}:{count:5}")
-
-@dataclass
-class Invocation:
-    args: Tuple
-    kwargs: OrderedDict[str, Any] = field(default_factory = OrderedDict)
-    output: Tuple = field(default_factory = tuple)
-    elapsed: float = 0
-
-    def __str__(self) -> str:
-        def summarize_arg(arg: Any) -> str:
-            if isinstance(arg, dict):
-                return str(dict({k: summarize_arg(v) for k,v in arg.items()}))
-            elif isinstance(arg, tuple):
-                return str(tuple(summarize_arg(v) for v in arg))
-            elif isinstance(arg, list):
-                return str(list([summarize_arg(v) for v in arg]))
-            elif isinstance(arg, torch.Tensor):
-                if arg.numel() < 10:
-                    return str(arg)
-                else:
-                    return _print_param(arg.size(), arg.dtype, arg.device) + " " + str(arg.device)
-            else:
-                return str(arg)
-
-        summarized_args = list(map(summarize_arg, self.args))
-        summarized_kwargs = {k: summarize_arg(v) for k,v in self.kwargs.items()}
-
-        return f"Invocation(elapsed={print_elapsed(self.elapsed)} args={summarized_args} kwargs={summarized_kwargs})"
-
-@dataclass
-class SummaryData:
-    arg_lengths: Dict[int, int] = field(default_factory = dict)
-    args: List[VariableInfo] = field(default_factory = list)
-    kwargs: Dict[str, VariableInfo] = field(default_factory = dict)
-
-    def print_args(self, indent: int = 0):
-        ind = ' ' * indent
-        for i in range(len(self.args)):
-            arg = self.args[i]
-            print(f"{ind}{i}: {arg}")
-
-        for kw,arg in self.kwargs.items():
-            print(f"{ind}{kw}: {arg}")
-
-    def add(self, other: 'SummaryData'):
-        """
-        Add another summary to make a combined summary.
-        """
-        for l,n in other.arg_lengths.items():
-            self.arg_lengths[l] = self.arg_lengths.get(l, 0) + n
-
-        for i,ad in enumerate(other.args):
-            if i < len(self.args):
-                self.args[i].combine(ad)
-            else:
-                self.args.append(ad)
-
-        for n,ad in other.kwargs.items():
-            if n in self.kwargs:
-                self.kwargs[n].combine(ad)
-            else:
-                self.kwargs[n] = ad
-
-@dataclass
-class Invocations:
-    m: Module
-    path: str
-    sig: inspect.Signature
-    calls: List[Invocation] = field(default_factory = list)
-    children: Dict[str, 'Invocations'] = field(default_factory = dict)
-
-    def __init__(self, m: Module, path: str, *,
-                 sig: Optional[inspect.Signature] = None,
-                 calls: Optional[List[Invocation]] = None,
-                 children: Optional[Dict[str, 'Invocations']] = None):
-        self.m = m
-        self.path = path
-        self.sig = inspect.signature(m.forward) if sig is None else sig
-        self.calls = [] if calls is None else calls
-        self.children = {} if children is None else children
-
-    def total_runtime(self) -> float:
-        return sum([c.elapsed for c in self.calls])
-
-    def __str__(self) -> str:
-        return f"Invocations(path={self.path} module={self.m._get_name()} runtime={print_elapsed(self.total_runtime())} ncalls={len(self.calls)} nchildren={len(self.children)})" # sig={inspect.signature(self.m.forward)})"
-
-    def summarize(self) -> SummaryData:
-        vars = Variables()
-        result = SummaryData()
-
-        max_nargs = 0
-        all_kwargs: Set[str] = set()
-        for c in self.calls:
-            nargs = len(c.args)
-            result.arg_lengths[nargs] = result.arg_lengths.get(nargs, 0) + 1
-            max_nargs = max(max_nargs, nargs)
-            all_kwargs.update(c.kwargs.keys())
-
-        print("max_nargs", max_nargs)
-        print("parameters=", self.sig.parameters)
-        ordered_params: List[Tuple[str, inspect.Parameter]] = list(self.sig.parameters.items())
-
-        for i in range(max_nargs):
-            name,param = ordered_params[i]
-            print("param", name, param)
-            samples = [c.args[i] for c in self.calls if i < len(c.args[i])]
-
-            torch_type = _to_torch_type(param.annotation, samples)
-            result.args.append(vars.sampled(name=name, torch_type=torch_type, samples=samples, produced_by=None, produced=-1))
-            
-
-        for k in all_kwargs:
-            param = self.sig.parameters[k]
-            samples = [c.kwargs.get(k) for c in self.calls if k in c.kwargs]
-            torch_type = _to_torch_type(param.annotation, samples)
-            result.kwargs[k] = vars.sampled(name=k, torch_type=torch_type, samples=samples, produced_by=None, produced=-1)
-
-        return result
 
 def record_invocations(model: Module) -> Tuple[Invocations, Callable]:
     """

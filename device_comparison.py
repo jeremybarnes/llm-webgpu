@@ -119,7 +119,7 @@ def device_comparison_mode(model: Module, master_device: torch.device, master_dt
                 print("weights are", module.weight.shape)
                 idx = args[0][0][0].item()
                 print("index weights are", module.weight[idx][0:10])
-                index: Tensor = args[0]
+                index: torch.Tensor = args[0]
                 print(f"index.storage = { index.storage() } offset = { index.storage_offset() })")
                 if module.weight[idx].ne(master_output[0][0]).any():
                     for i in range(module.weight.shape[0]):
@@ -159,7 +159,7 @@ def device_comparison_mode(model: Module, master_device: torch.device, master_dt
 
                     if debug:
                         print(f"Embedding: slave output {slave_output[0].shape}", slave_output[0][0][0:10])
-                        print("index weights are", slave.weight[idx][0:10])
+                        #print("index weights are", slave.weight[idx][0:10])
 
                     slave_output = fixup_to_master(slave_output)
 
@@ -168,11 +168,9 @@ def device_comparison_mode(model: Module, master_device: torch.device, master_dt
                     raise
                     return None
 
-                biggest: List[Optional[TensorDifference]] = [None]
-
-                compare_output(master_output, slave_output, str(device) + " " + str(dtype) + " " + path)
-                print(prefix + f" {biggest[0].ulps:>5} ulps")
-                if biggest[0].ulps > 1000:
+                diff = compare_output(master_output, slave_output, str(device) + " " + str(dtype) + " " + path)
+                print(prefix + f" {diff.ulps:>5} ulps")
+                if diff.ulps > 1000:
                     raise RuntimeError("too big an ULPS difference")
 
             return None

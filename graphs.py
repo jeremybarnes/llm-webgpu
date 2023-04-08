@@ -1,17 +1,17 @@
-from aten import int_to_dtype, dtype_to_int, int_to_memory_format
+from aten import int_to_dtype, optional_int_to_dtype, dtype_to_int, int_to_memory_format
 from utils import summarize_tensor
 import torch
 from typing import Type, Tuple, Any, Dict, List, Optional, Generator, Callable, OrderedDict, Sequence, Mapping
 
 from torch.nn import Module
-from torch import Tensor, ScriptModule, ScriptFunction, Value, Size, Block, dtype, memory_format, device, scalar_tensor, add, tanh
+from torch import Tensor, ScriptModule, ScriptFunction, Value, Size, Block, dtype, memory_format, device, scalar_tensor, add, sub, tanh
 import torch.jit as jit
 
 from torch._C import Graph, Node, dtype as cdtype
 import inspect
 from dataclasses import dataclass, field
 from ansi.color import bg, fg
-from ansi.color.fx import reset
+from ansi.color.fx import reset # pyright: ignore
 import traceback
 
 Inputs = Tuple[Any, ...]
@@ -101,9 +101,12 @@ def prim_constant(n: Node) -> NodeOperator:
         return val.toIValue()
     return exec_prim_constant
 
-@exec_op("prim::Uninitialized")
-def prim_uninitialized():
-    return None
+@compile_op("prim::Uninitialized")
+def prim_uninitialized(n: Node) -> NodeOperator:
+    val = n.output()
+    if val.type().isSubtypeOf(torch.FloatType.get()):
+        return lambda: 0.0
+    raise NotImplementedError("prim::Uninitialized of type {val.type()}")
 
 @exec_op("prim::RaiseException")
 def prim_raise_exception(msg: str, exctype: str):
@@ -165,7 +168,7 @@ def aten_format(fmt: str, *args) -> str:
 
 @exec_op("aten::scalar_tensor")
 def aten_scalar_tensor(val, dtype=None, layout=None, device=None, pin_memory=None) -> Tensor:
-    return scalar_tensor(val, dtype=int_to_dtype(dtype), layout=layout, device=device, pin_memory=pin_memory)
+    return scalar_tensor(val, dtype=optional_int_to_dtype(dtype), layout=layout, device=device, pin_memory=pin_memory)
 
 @compile_op("aten::size")
 def compile_aten_size(n: Node) -> NodeOperator:
@@ -235,9 +238,19 @@ def compile_aten_slice(n: Node) -> NodeOperator:
         return aten_slice_python
 
 @exec_op("aten::__isnot__")
-def is_not(v: Any, o: Any) -> bool:
+def aten_is_not(v: Any, o: Any) -> bool:
+    #print(v, "is_not", o, "=", v is not o)
     return v is not o
-    
+
+#@compile_op("aten::__isnot__")
+#def compile_aten_isnot(n: Node) -> NodeOperator:
+#
+#    def aten_is_not(v: Any, o: Any) -> bool:
+#        #print(n, v, "is_not", o, "=", v is not o)
+#        return v is not o
+#    
+#    return aten_is_not
+
 @exec_op("aten::__is__")
 def aten_is(v: Any, o: Any) -> bool:
     return v is o
@@ -316,6 +329,23 @@ def compile_aten_add(n: Node) -> NodeOperator:
         return aten_add_tensors
     else:
         return aten_add
+
+@compile_op("aten::sub")
+def compile_aten_sub(n: Node) -> NodeOperator:
+    def aten_sub_tensors(t1: Tensor, t2: Tensor, alpha = 1):
+        return sub(t1, t2, alpha=alpha)
+    def aten_sub(t1: Any, t2: Any):
+        #print(f"aten_sub: {type(t1)} + {type(t2)}")
+        return t1 - t2
+
+    # Choose which one based on the type of the first argument
+    input1 = n.inputsAt(0)
+    input2 = n.inputsAt(1)
+    #print(input1.type(), input2.type())
+    if n.inputsSize() == 3 or (input1.type().kind() == "TensorType" and input2.type().kind() == "TensorType"):
+        return aten_sub_tensors
+    else:
+        return aten_sub
 
 @interpret_op("prim::If")
 def exec_prim_if(s: 'Scope', n: Node):
